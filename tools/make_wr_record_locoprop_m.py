@@ -223,6 +223,20 @@ def generate(source: Path, output: Path, train_steps: int, schedule_steps: int |
         "FINAL_TRAIN_STEPS = 3040\n",
         f"FINAL_TRAIN_STEPS = int(os.environ.get(\"FINAL_TRAIN_STEPS\", \"{train_steps}\"))\n",
     )
+    text = replace_exact(
+        text,
+        "TRAIN_PROGRESS_INTERVAL = 0\n",
+        'TRAIN_PROGRESS_INTERVAL = int(os.environ.get("TRAIN_PROGRESS_INTERVAL", "0"))\n'
+        'if TRAIN_PROGRESS_INTERVAL < 0:\n'
+        '    raise ValueError("TRAIN_PROGRESS_INTERVAL must be nonnegative")\n',
+    )
+    text = replace_exact(
+        text,
+        "val_regular_interval = 125\n",
+        'val_regular_interval = int(os.environ.get("SCREEN_VAL_EVERY", "125"))\n'
+        'if val_regular_interval <= 0:\n'
+        '    raise ValueError("SCREEN_VAL_EVERY must be positive")\n',
+    )
     if schedule_steps is not None:
         text = replace_exact(
             text,

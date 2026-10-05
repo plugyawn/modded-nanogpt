@@ -8,7 +8,7 @@ schedule_steps="${WR_SCHEDULE_STEPS:-3105}"
 nproc="${NPROC_PER_NODE:-1}"
 seed="${WR_SEED:-28}"
 torch_version="${WR_TORCH_VERSION:-2.11.0}"
-torch_index_url="${WR_TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu130}"
+torch_index_url="${WR_TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}"
 default_data_chunks=$(( ((steps + 1) * 524288 + 100000000 - 1) / 100000000 ))
 data_chunks="${WR_DATA_CHUNKS:-${default_data_chunks}}"
 

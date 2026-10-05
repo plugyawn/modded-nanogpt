@@ -458,3 +458,36 @@ def test_modal_record_payload_preserves_source_schedule_defaults(explicit_overri
     assert payload["TRACK3_LR_SCHEDULE"] == ("power" if explicit_override else "pr287")
     assert payload["TRACK3_LR_POWER"] == ("1.1" if explicit_override else "1.2")
     assert payload["TRACK3_LR_SCHEDULE_STEPS"] == ("3000" if explicit_override else "3105")
+
+
+@pytest.mark.parametrize("overrides, expected, error", [
+    ({}, (0, 125), None),
+    ({"TRAIN_PROGRESS_INTERVAL": "25", "SCREEN_VAL_EVERY": "5"}, (25, 5), None),
+    ({"TRAIN_PROGRESS_INTERVAL": "-1"}, None, "TRAIN_PROGRESS_INTERVAL"),
+    ({"SCREEN_VAL_EVERY": "0"}, None, "SCREEN_VAL_EVERY"),
+    ({"SCREEN_VAL_EVERY": "-5"}, None, "SCREEN_VAL_EVERY"),
+])
+def test_wr_record_honors_and_validates_logging_intervals(tmp_path, monkeypatch, overrides, expected, error):
+    source = ROOT / "records/track_3_optimization/results/20260509_contra_soft_muon/03c36e81-e2e5-4916-bf16-0141999b1dbb.txt"
+    output = tmp_path / "generated.py"
+    generator("make_wr_record_locoprop_m").generate(source, output, 125, 3105)
+    names = {"TRAIN_PROGRESS_INTERVAL", "val_regular_interval"}
+    # Execute the actual generated assignments and guards without starting its CUDA driver.
+    nodes = [node for node in ast.parse(output.read_text()).body
+             if (isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id in names
+                                                      for target in node.targets))
+             or (isinstance(node, ast.If) and any(isinstance(child, ast.Name) and child.id in names
+                                                  for child in ast.walk(node.test)))]
+    assert len(nodes) == 4
+    for name in ("TRAIN_PROGRESS_INTERVAL", "SCREEN_VAL_EVERY"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in overrides.items():
+        monkeypatch.setenv(name, value)
+    namespace = {"os": os}
+    code = compile(ast.Module(body=nodes, type_ignores=[]), str(output), "exec")
+    if error:
+        with pytest.raises(ValueError, match=error):
+            exec(code, namespace)
+    else:
+        exec(code, namespace)
+        assert tuple(namespace[name] for name in ("TRAIN_PROGRESS_INTERVAL", "val_regular_interval")) == expected

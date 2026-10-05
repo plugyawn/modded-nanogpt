@@ -238,7 +238,7 @@ TRACK3_SOFT_MUON_CEIL=0.80
 
 ## Historical Read
 
-The strongest current evidence is that LocoProp-M creates real early/mid-run
+The historical evidence suggested that LocoProp-M created early/mid-run
 loss improvements, but the later handoff/suffix has not preserved those gains.
 The refresh3 plot shows the failure mode clearly: the LocoProp suffixes cluster
 around `3.302-3.306 @3000`, while the WR/reference means continue descending to
@@ -246,8 +246,8 @@ about `3.281 @3000`.
 
 ## Historical Model-State Handoff
 
-The direct current-record WR + LocoProp-M hook integration OOMed before step 0
-on Prime. The next probe is therefore a model-state handoff:
+The historical direct current-record WR + LocoProp-M hook integration OOMed
+before step 0 on Prime. That motivated a model-state handoff:
 
 ```text
 simple Track 3 + LocoProp-M prefix checkpoint at step 1600
@@ -293,8 +293,9 @@ The regression suite covers zero-gradient BF16 replay, matching-objective
 gradients, backtracking, final-iterate acceptance, post-outer-step rejection,
 bounded capture, native MLP gradients, fullgraph compilation (including CPU
 Inductor), schedule preservation, and two-rank Gloo collectives/checkpoint restore.
-The sharded fused-MLP test uses a CPU substitute for the Triton kernel; actual
-CUDA kernels, NCCL, peak H100 memory and final FineWeb loss require GPU validation.
+The local sharded fused-MLP test uses a CPU substitute for the Triton kernel.
+The October 6 GPU checks below additionally exercise the actual CUDA kernels.
+NCCL and end-to-end sharded-bank training still require multi-GPU validation.
 
 On an already provisioned GPU, first run a short May 9 record smoke test:
 
@@ -311,3 +312,53 @@ Check finite training loss, peak memory, step time, acceptance rates, and valida
 loss before extending to full runs and multiple matched seeds. Local objective
 decrease establishes a solver invariant; it does not establish a final validation
 loss advantage over the record optimizer.
+
+The May 9 WR record adapter honors `TRAIN_PROGRESS_INTERVAL` (default 0,
+nonnegative) and `SCREEN_VAL_EVERY` (default 125, positive). These previously
+remained fixed constants despite the environment configuration. The Prime WR
+launchers default to PyTorch 2.11 with CUDA 12.8 wheels. CUDA 12.6 NVRTC cannot
+compile the root fused cross-entropy kernel's `__tanhf` intrinsic; the full
+`triton_kernels.py` import and fused probes passed with CUDA 12.8 on driver
+570.148.08. Preserve that driver/runtime compatibility when changing the image.
+
+## October 6 GPU Validation
+
+The repaired implementation passed actual H100 checks for BF16 native-equivalent
+MLP forward/backward, exact zero correction for a zero target gradient, fullgraph
+compiled capture across changing active windows, finite high-curvature
+backtracking, Newton-Muon covariance hooks across eager refresh/compiled ordinary
+steps, the flattened Triton fused MLP, and BF16 mantissa-preserving optimizer
+application. CPU tests additionally cover two-rank collectives and checkpoint
+restore. These are correctness checks, not evidence of a final loss advantage.
+
+Short May 9 screens used seed 3710, 524,288 global tokens/update, microbatch 64,
+the source PR287 horizon 3105, four local steps, proximal coefficient 0.1, and
+PyTorch 2.11/CUDA 12.6 on one H100 SXM5. Both arms enabled capture and solving;
+alpha 0 disabled application in the control. All completed without OOM or
+nonfinite loss. The 10-step smoke peaked at 28.94 GB allocated. Selected
+125-step results:
+
+| Alpha | Target gamma | Samples | Norm cap | Validation loss | Training seconds | Peak allocated GB |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0 | 1 | 1024 | 0.20 | 4.51579 | 208.848 | 28.96 |
+| 1 | 1 | 1024 | 0.20 | 4.52038 | 225.781 | 28.96 |
+| 1 | 100 | 1024 | 0.20 | 4.53044 | 211.293 | 28.96 |
+| 1 | 300 | 1024 | 0.20 | 4.54275 | 210.461 | 28.96 |
+| 1 | 100 | 8192 | 0.20 | 4.53975 | 308.458 | 31.31 |
+| 1 | 100 | 8192 | 0.05 | 4.51961 | 293.355 | 31.31 |
+
+Times include compilation and are not warmed throughput measurements. The
+larger sample budget improved diagnostic gradient alignment but did not establish
+a validation gain. Gamma 1 produced mostly tiny or rejected corrections; larger
+gamma made corrections active and sometimes degraded early validation. The outer
+optimizer can already move beyond the local target, causing the application gate
+to reject an otherwise accepted inner solve. A stable local solve alone does not
+justify larger additive corrections.
+
+A full 3040-step comparison is running with the same seed/source/data revision
+and schedule, CUDA 12.8, samples 8192, gamma 100, cap 0.05, and alpha 0 versus 1.
+Two independent H100 SXM5 allocations run concurrently. Full results are pending;
+single-seed screens must not be presented as a record or statistically established
+improvement. Controller artifacts live outside the repository in
+`../experiments`, including the full configuration, resource ledger, result
+checksums, and automatic collection/termination supervisor.
