@@ -2,7 +2,7 @@
 
 This branch contains the Track 3 LocoProp-M experiment harness used for the
 recent optimizer-schedule sweeps. It is experimental code, not a record claim.
-The latest plotted tail comparison ends with the best new lane at
+The historical, pre-fix tail comparison ends with the best new lane at
 `3.30262 @3000`, well outside the current WR/reference band.
 
 Latest plot artifacts:
@@ -15,7 +15,8 @@ Latest plot artifacts:
 ## What The Harness Does
 
 `tools/make_track3_locoprop_m.py` generates a Track 3 training script from
-`train_gpt.py` and adds:
+`records/track_3_optimization/train_gpt_simple.py` (or the Newton-Muon/May 9
+record source) and adds:
 
 - MLP `c_fc` LocoProp-M local correction probes.
 - Norm-capped additive correction application.
@@ -27,6 +28,70 @@ Latest plot artifacts:
 `tools/run_track3_locoprop_m.sh` is the local runner. It prints source,
 generator, and generated-script SHA256 hashes before training so checkpoint
 provenance can be reconstructed.
+
+The three generators embed the same numerical/capture implementation from
+`tools/locoprop_local.py`. Generated scripts remain self-contained. The separate
+`make_wr_record_locoprop_m.py` targets the May 9 module-level record, while
+`make_wr_locoprop_m.py` targets the sharded `train_gpt.py` bank.
+
+## Solver and Capture Fixes
+
+The local replay starts at the captured BF16 preactivation and models a weight
+displacement as `pre0 + X @ delta.T`. This makes a zero target gradient produce
+exactly zero correction, eliminating the previous BF16-forward/FP32-replay
+residual. It is a local surrogate anchored to the forward pass; it is not a
+bit-exact simulation of every later BF16 weight update.
+
+For squared ReLU, the matching potential is `relu(z)^3 / 3`. The solver now
+checks its regularized Bregman objective, including the proximal term, rather
+than output MSE. Armijo backtracking stabilizes inner steps, and the final
+stored correction is checked after the last update and dtype conversion.
+The default gates require finite values, a decrease in that objective, and
+nonnegative alignment with the full weight-gradient descent direction. The
+sharded bank checks the reduced full gradient inside the optimizer, after
+reduce-scatter; preparation uses the globally gathered sample gradient.
+
+The correction is capped with alpha included, then checked again at the weights
+the outer optimizer actually reached. A correction that no longer decreases the
+local objective is shrunk or skipped. Norm targets are upper limits and never
+amplify a small correction to fill a requested norm. RMS state commits only
+when the correction is applied.
+
+Sample capture writes paired input/preactivation/gradient rows into fixed FP32
+buffers through an opaque backward custom op. It retains no strided views of
+full activations. The global sample budget is spread across all microbatches
+by default; each rank gets `ceil(sample_tokens / world_size)` rows. Stratified
+sampling uses a separate RNG, preserving training RNG. Set `ACCUM_SAMPLES=0`
+explicitly for a last-microbatch control. Compilation is enabled by default and
+active-window changes do not require recompilation. The Python-backed capture
+op is tagged `cudagraph_unsafe` so its schedule/RNG state is read on every call.
+Newton-Muon covariance refresh steps retain the Linear module hooks and call
+the eager root forward; ordinary steps use the compiled MLP capture path.
+
+Multi-rank sample collectives run in the same layer order before owner filtering.
+The module-level WR path caps against the actual gathered outer-step displacement,
+so correction application does not depend on owner-only optimizer state.
+
+Diagnostics retain `loss0`/`lossK` field names, but now report the matching
+objective **relative to the initial iterate**: `loss0=0`, and a negative `lossK`
+means improvement. Historical MSE values are not comparable. `accepted` reports
+solver acceptance; `accepted_apply` reports the final application gate. Inspect
+`backtracks`, `local_steps`, `inner_lr`, and `reason` alongside correction norms.
+
+Source schedule/seed defaults are preserved when adapting the May 9 record
+(`pr287`, horizon 3105, power 1.2; its native seed initialization is not run a
+second time). The runner's seed controls select the CLI seed. Explicit
+environment overrides still apply. Automatic LR switches blend for 100 steps;
+set `TRACK3_LR_SWITCH_BLEND_STEPS=0` to reproduce the old abrupt switch.
+The runner detects positional trial counts versus `--seed` and runs each
+requested record trial with a distinct seed.
+
+New Track 3 checkpoints include each rank's optimizer state, optimizer step
+counter, local RMS state and RNG. Exact resumes require the saved world size.
+Newton-Muon covariance/inverse state is restored with its shared tensor views
+rebound, so later refreshes continue updating the inverse used by the optimizer.
+Legacy single-rank checkpoints remain readable; legacy multi-rank checkpoints
+cannot recover optimizer/RMS/RNG state that was never saved.
 
 ## Local 1x Run
 
@@ -123,6 +188,13 @@ Core LocoProp-M:
 TRACK3_LOCOM_ENABLED=1
 TRACK3_LOCOM_LAYERS=all
 TRACK3_LOCOM_STEPS=4
+TRACK3_LOCOM_SAMPLE_TOKENS=1024
+TRACK3_LOCOM_ACCUM_SAMPLES=1
+TRACK3_LOCOM_MICRO_SAMPLE_TOKENS=0
+TRACK3_LOCOM_COMPILE=1
+TRACK3_LOCOM_REQUIRE_LOSS_DECREASE=1
+TRACK3_LOCOM_MIN_COS_DESC=0.0
+TRACK3_LOCOM_MAX_BACKTRACKS=20
 TRACK3_LOCOM_NORM_CAP=0.20
 TRACK3_LOCOM_ACTIVE_WINDOWS=0:1800
 TRACK3_LOCOM_END_STEP=1800
@@ -134,6 +206,7 @@ Schedule controls:
 TRACK3_LR_SCHEDULE=linear|power|pr287
 TRACK3_LR_POWER=1.0
 TRACK3_LR_SCHEDULE_STEPS=3000
+TRACK3_LR_SWITCH_BLEND_STEPS=100
 TRACK3_LR_BLEND_START=1800
 TRACK3_LR_BLEND_END=2000
 TRACK3_LR_BLEND_TARGET=pr287
@@ -163,7 +236,7 @@ TRACK3_SOFT_MUON_END_STEP=3010
 TRACK3_SOFT_MUON_CEIL=0.80
 ```
 
-## Current Read
+## Historical Read
 
 The strongest current evidence is that LocoProp-M creates real early/mid-run
 loss improvements, but the later handoff/suffix has not preserved those gains.
@@ -171,7 +244,7 @@ The refresh3 plot shows the failure mode clearly: the LocoProp suffixes cluster
 around `3.302-3.306 @3000`, while the WR/reference means continue descending to
 about `3.281 @3000`.
 
-## Current Next Probe
+## Historical Model-State Handoff
 
 The direct current-record WR + LocoProp-M hook integration OOMed before step 0
 on Prime. The next probe is therefore a model-state handoff:
@@ -205,3 +278,36 @@ bash tools/prime_wr_record_resume_remote.sh
 
 on a synced Prime H100/GH200 pod. The rationale and launch gates are recorded
 in `.opencode/track3_wr_resume_handoff_plan_20260603.md`.
+
+## Validate the Fixed Integration
+
+Local correctness checks require pytest and the repository's PyTorch version:
+
+```bash
+python -m pytest -q tests
+TRACK3_DRY_RUN=1 bash tools/run_track3_locoprop_m.sh
+WR_LOCOM_DRY_RUN=1 bash tools/run_wr_record_locoprop_m.sh
+```
+
+The regression suite covers zero-gradient BF16 replay, matching-objective
+gradients, backtracking, final-iterate acceptance, post-outer-step rejection,
+bounded capture, native MLP gradients, fullgraph compilation (including CPU
+Inductor), schedule preservation, and two-rank Gloo collectives/checkpoint restore.
+The sharded fused-MLP test uses a CPU substitute for the Triton kernel; actual
+CUDA kernels, NCCL, peak H100 memory and final FineWeb loss require GPU validation.
+
+On an already provisioned GPU, first run a short May 9 record smoke test:
+
+```bash
+WR_TRAIN_STEPS=10 WR_SCHEDULE_STEPS=3105 WR_SEED=3710 \
+WR_LOCOM_COMPILE=1 SCREEN_VAL_EVERY=5 \
+bash tools/run_wr_record_locoprop_m.sh
+```
+
+Then compare a 125-step screen against `WR_LOCOM_ALPHA=0` using the same source,
+seed, microbatch size, sample capture, compilation and schedule horizon. Keep
+LocoProp enabled in both arms so the control includes capture/solve overhead.
+Check finite training loss, peak memory, step time, acceptance rates, and validation
+loss before extending to full runs and multiple matched seeds. Local objective
+decrease establishes a solver invariant; it does not establish a final validation
+loss advantage over the record optimizer.

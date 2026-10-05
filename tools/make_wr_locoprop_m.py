@@ -12,6 +12,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+SHARED_LOCAL_SOURCE = Path(__file__).with_name("locoprop_local.py").read_text()
+
 
 WR_LOCOM_CONFIG = r'''
 def _wr_locom_env_flag(name: str, default: str = "0") -> bool:
@@ -46,8 +48,8 @@ WR_LOCOM_PROX = float(os.environ.get("WR_LOCOM_PROX", "0.1"))
 WR_LOCOM_ALPHA = float(os.environ.get("WR_LOCOM_ALPHA", "1.0"))
 WR_LOCOM_NORM_TO_BASE = _wr_locom_env_flag("WR_LOCOM_NORM_TO_BASE", "0")
 WR_LOCOM_NORM_CAP = float(os.environ.get("WR_LOCOM_NORM_CAP", "0.20"))
-WR_LOCOM_REQUIRE_LOSS_DECREASE = _wr_locom_env_flag("WR_LOCOM_REQUIRE_LOSS_DECREASE", "0")
-WR_LOCOM_MIN_COS_DESC = float(os.environ.get("WR_LOCOM_MIN_COS_DESC", "-inf"))
+WR_LOCOM_REQUIRE_LOSS_DECREASE = _wr_locom_env_flag("WR_LOCOM_REQUIRE_LOSS_DECREASE", "1")
+WR_LOCOM_MIN_COS_DESC = float(os.environ.get("WR_LOCOM_MIN_COS_DESC", "0.0"))
 WR_LOCOM_START_STEP = int(os.environ.get("WR_LOCOM_START_STEP", "0"))
 WR_LOCOM_END_STEP = int(os.environ.get("WR_LOCOM_END_STEP", "1000000000"))
 WR_LOCOM_INTERVAL = int(os.environ.get("WR_LOCOM_INTERVAL", "1"))
@@ -57,10 +59,13 @@ WR_LOCOM_LOG_STEPS = {
     if x.strip()
 }
 
+WR_LOCOM_MAX_BACKTRACKS = int(os.environ.get("WR_LOCOM_MAX_BACKTRACKS", "20"))
+WR_LOCOM_ACCUM_SAMPLES = _wr_locom_env_flag("WR_LOCOM_ACCUM_SAMPLES", "1")
+WR_LOCOM_CAPTURE_BUFFERS = {}
+
 WR_LOCOM_CURRENT_STEP = -1
 WR_LOCOM_OWNED_LAYER_SET: set[int] = set()
-WR_LOCOM_LAYER_SAMPLES: dict[int, dict[str, Tensor]] = {}
-WR_LOCOM_LAYER_CORR: dict[int, Tensor] = {}
+WR_LOCOM_LAYER_CORR: dict[int, tuple] = {}
 WR_LOCOM_APPLY_STATS: list[str] = []
 
 def _wr_locom_active(step: int) -> bool:
@@ -79,38 +84,22 @@ def _wr_locom_layer_active(layer_idx: int) -> bool:
 def _wr_locom_begin_step(step: int):
     global WR_LOCOM_CURRENT_STEP
     WR_LOCOM_CURRENT_STEP = step
-    WR_LOCOM_LAYER_SAMPLES.clear()
+    loco_begin_capture(step, grad_accum_steps, _wr_locom_active(step),
+                       WR_LOCOM_LAYER_SET, WR_LOCOM_ACCUM_SAMPLES, dist.get_rank())
     WR_LOCOM_LAYER_CORR.clear()
     WR_LOCOM_APPLY_STATS.clear()
 
-@torch.no_grad()
-def _wr_locom_local_sample_rows(x: Tensor) -> Tensor:
-    flat = x.reshape(-1, x.size(-1))
-    sample_tokens = WR_LOCOM_SAMPLE_TOKENS
-    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1 and sample_tokens > 0:
-        sample_tokens = max(1, (sample_tokens + dist.get_world_size() - 1) // dist.get_world_size())
-    if sample_tokens <= 0 or flat.size(0) <= sample_tokens:
-        return flat.detach()
-    stride = max(flat.size(0) // sample_tokens, 1)
-    return flat[::stride][:sample_tokens].detach()
-
-@torch.no_grad()
-def _wr_locom_capture_forward_sample(layer_idx: int, x: Tensor, post: Tensor):
-    if not (_wr_locom_active(WR_LOCOM_CURRENT_STEP) and _wr_locom_layer_active(layer_idx)):
+def initialize_wr_loco_capture(model):
+    if not WR_LOCOM_ENABLED:
         return
-    WR_LOCOM_LAYER_SAMPLES[layer_idx] = {
-        "x": _wr_locom_local_sample_rows(x).to(torch.bfloat16),
-        "post": _wr_locom_local_sample_rows(post).to(torch.bfloat16),
-    }
-
-@torch.no_grad()
-def _wr_locom_capture_backward_sample(layer_idx: int, dpre: Tensor):
-    if not (_wr_locom_active(WR_LOCOM_CURRENT_STEP) and _wr_locom_layer_active(layer_idx)):
-        return
-    sample = WR_LOCOM_LAYER_SAMPLES.get(layer_idx)
-    if sample is None:
-        return
-    sample["dpre"] = _wr_locom_local_sample_rows(dpre).to(torch.bfloat16)
+    dim, hidden = model.mlp_bank.shape[-1], model.mlp_bank.shape[-2]
+    for layer in sorted(WR_LOCOM_LAYER_SET):
+        if layer < 0 or layer >= 11:
+            raise ValueError("WR LocoProp layer index must be in 0..10")
+        buffer = loco_sample_buffer(WR_LOCOM_SAMPLE_TOKENS, dim, hidden, world_size)
+        buffer = buffer.to(device=model.mlp_bank.device)
+        model.register_buffer(f"_wr_loco_samples_{layer}", buffer, persistent=False)
+        WR_LOCOM_CAPTURE_BUFFERS[layer] = buffer
 
 @torch.no_grad()
 def _wr_locom_gather_sample(t: Tensor) -> Tensor:
@@ -151,71 +140,43 @@ def prepare_wr_locoprop_m(loco_model: nn.Module, step: int) -> None:
     if not _wr_locom_active(step):
         return
     stats = []
-    for layer_idx in sorted(WR_LOCOM_OWNED_LAYER_SET):
-        sample = WR_LOCOM_LAYER_SAMPLES.get(layer_idx)
-        if sample is None or "x" not in sample or "post" not in sample or "dpre" not in sample:
+    for layer_idx in sorted(WR_LOCOM_LAYER_SET):
+        sx, sp, sg = loco_samples(WR_LOCOM_CAPTURE_BUFFERS[layer_idx], layer_idx,
+                                  loco_model.mlp_bank.shape[-1])
+        if sx.shape[0] == 0:
             continue
-        x = _wr_locom_gather_sample(sample["x"])
-        post0 = _wr_locom_gather_sample(sample["post"])
-        dpre = _wr_locom_gather_sample(sample["dpre"])
-        target = post0 - WR_LOCOM_TARGET_GAMMA * dpre
-
-        W0 = loco_model.mlp_bank[layer_idx, 0].detach().float()
-        W = W0.clone()
-        inv_n = 1.0 / max(x.size(0), 1)
-        loss0 = None
-        loss_k = None
-
-        for _ in range(WR_LOCOM_LOCAL_STEPS):
-            pre = x @ W.mT
-            post = pre.relu().square()
-            err = post - target
-            loss_k = 0.5 * err.square().mean()
-            if loss0 is None:
-                loss0 = loss_k
-            grad_w = err.mT @ x
-            grad_w.mul_(inv_n)
-            if WR_LOCOM_PROX != 0:
-                grad_w.add_(W - W0, alpha=WR_LOCOM_PROX)
-            W.add_(grad_w, alpha=-WR_LOCOM_INNER_LR)
-
-        corr = (W - W0).to(loco_model.mlp_bank.dtype)
-        corr_f = corr.float()
-        raw_grad = loco_model.mlp_bank.grad[layer_idx, 0].float() if loco_model.mlp_bank.grad is not None else None
-        if raw_grad is not None:
-            raw_desc = -raw_grad
-            denom = corr_f.norm().mul(raw_desc.norm()).clamp_min(1e-12)
-            cosine = corr_f.flatten().dot(raw_desc.flatten()) / denom
-            grad_norm = float(raw_grad.norm())
-            cos_desc = float(cosine)
-        else:
-            grad_norm = float("nan")
-            cos_desc = float("nan")
-        loss_decreased = bool(loss_k <= loss0)
-        accepted = True
-        if WR_LOCOM_REQUIRE_LOSS_DECREASE and not loss_decreased:
-            accepted = False
-        if cos_desc < WR_LOCOM_MIN_COS_DESC:
-            accepted = False
-        if accepted:
-            WR_LOCOM_LAYER_CORR[layer_idx] = corr
-
+        # Collectives must occur in identical layer order on every rank.
+        x, pre0, dpre = _wr_locom_gather_sample(sx), _wr_locom_gather_sample(sp), _wr_locom_gather_sample(sg)
+        if layer_idx not in WR_LOCOM_OWNED_LAYER_SET:
+            continue
+        # The bank's full gradient is reduce-scattered inside optimizer.step.
+        # Solve against the shared sample gradient here, then check alignment
+        # with that reduced full gradient immediately before applying.
+        raw_grad = dpre.mT @ x / x.shape[0]
+        corr, diag, _ = loco_solve(
+            x, pre0, dpre, raw_grad, steps=WR_LOCOM_LOCAL_STEPS,
+            inner_lr=WR_LOCOM_INNER_LR, gamma=WR_LOCOM_TARGET_GAMMA,
+            prox=WR_LOCOM_PROX, min_cos=WR_LOCOM_MIN_COS_DESC,
+            require_decrease=WR_LOCOM_REQUIRE_LOSS_DECREASE,
+            max_backtracks=WR_LOCOM_MAX_BACKTRACKS, output_dtype=loco_model.mlp_bank.dtype,
+        )
+        if diag["accepted"]:
+            WR_LOCOM_LAYER_CORR[layer_idx] = (corr, loco_model.mlp_bank[layer_idx, 0].detach().float().clone(), x, pre0, dpre)
         if step in WR_LOCOM_LOG_STEPS and len(stats) < 6:
             stats.append(
-                f"l{layer_idx}:loss0={float(loss0):.3e}"
-                f",lossK={float(loss_k):.3e}"
-                f",corr_norm={float(corr_f.norm()):.3e}"
-                f",grad_norm={grad_norm:.3e}"
-                f",cos_desc={cos_desc:.3f}"
-                f",accepted={int(accepted)}"
-                f",tokens={x.size(0)}"
+                f"l{layer_idx}:loss0={diag['loss0']:.3e},lossK={diag['lossK']:.3e}"
+                f",corr_norm={float(corr.float().norm()):.3e}"
+                f",grad_norm={float(raw_grad.norm()):.3e}"
+                f",cos_desc={diag['cos_desc']:.3f},accepted={int(diag['accepted'])},tokens={x.size(0)}"
+                f",backtracks={diag['backtracks']},local_steps={diag['local_steps']}"
+                f",inner_lr={diag['inner_lr']:.3e},reason={diag['reason']}"
             )
 
     if step in WR_LOCOM_LOG_STEPS and stats:
         print0("wr_locom_prepare step=" + str(step) + " " + " | ".join(stats), console=True)
 
 @torch.no_grad()
-def _wr_locom_apply_mlp_chunk_corrections(optimizer, p_slice: Tensor, p_cfg, p_state: dict, v_chunk: Tensor, local_rank: int) -> None:
+def _wr_locom_apply_mlp_chunk_corrections(optimizer, p_slice: Tensor, p_cfg, p_state: dict, v_chunk: Tensor, local_rank: int, raw_grad_chunk: Tensor) -> None:
     if not (WR_LOCOM_ENABLED and p_cfg.label == "mlp_bank" and _wr_locom_active(WR_LOCOM_CURRENT_STEP)):
         return
     start_idx = local_rank * p_cfg.chunk_size
@@ -224,8 +185,16 @@ def _wr_locom_apply_mlp_chunk_corrections(optimizer, p_slice: Tensor, p_cfg, p_s
         if global_idx >= 22 or global_idx % 2 == 1:
             continue
         layer_idx = global_idx // 2
-        corr = WR_LOCOM_LAYER_CORR.get(layer_idx)
-        if corr is None:
+        context = WR_LOCOM_LAYER_CORR.pop(layer_idx, None)
+        if context is None:
+            continue
+        corr, reference, x, pre0, dpre = context
+        raw_grad = raw_grad_chunk[mat_idx]
+        denominator = (raw_grad.norm() * corr.float().norm()).clamp_min(1e-30)
+        cosine = -(corr.float() * raw_grad).sum() / denominator
+        if not bool(torch.isfinite(cosine) & torch.isfinite(denominator)) or float(cosine) < WR_LOCOM_MIN_COS_DESC or float(raw_grad.norm()) == 0:
+            if WR_LOCOM_CURRENT_STEP in WR_LOCOM_LOG_STEPS:
+                WR_LOCOM_APPLY_STATS.append(f"l{layer_idx}:accepted_apply=0,cos_desc={float(cosine):.3f},reason=full_gradient_gate")
             continue
 
         lr_mul = p_cfg.lr_mul
@@ -233,13 +202,15 @@ def _wr_locom_apply_mlp_chunk_corrections(optimizer, p_slice: Tensor, p_cfg, p_s
             lr_mul *= p_cfg.per_matrix_lr_mul[mat_idx]
         base_step_norm = v_chunk[mat_idx].float().norm().mul(p_cfg.lr * lr_mul)
         corr_norm = corr.float().norm().clamp_min(1e-12)
-        scale = torch.ones((), device=corr.device, dtype=torch.float32)
-        if WR_LOCOM_NORM_TO_BASE:
-            scale = base_step_norm / corr_norm
-        if WR_LOCOM_NORM_CAP > 0:
-            max_norm = WR_LOCOM_NORM_CAP * base_step_norm
-            scale = torch.minimum(scale, max_norm / corr_norm)
-        scale = scale * WR_LOCOM_ALPHA
+        scale = loco_correction_scale(corr, base_step_norm, alpha=WR_LOCOM_ALPHA,
+                                     cap=WR_LOCOM_NORM_CAP, norm_to_base=WR_LOCOM_NORM_TO_BASE)
+        scale = loco_post_step_scale(corr, scale, p_slice[mat_idx].float() - reference, x, pre0, dpre,
+                                    gamma=WR_LOCOM_TARGET_GAMMA, prox=WR_LOCOM_PROX,
+                                    max_backtracks=WR_LOCOM_MAX_BACKTRACKS)
+        if float(scale) == 0:
+            if WR_LOCOM_CURRENT_STEP in WR_LOCOM_LOG_STEPS:
+                WR_LOCOM_APPLY_STATS.append(f"l{layer_idx}:accepted_apply=0,scale=0,reason=post_step_gate")
+            continue
         optimizer._loco_full_add_lr_t.fill_(float(scale))
         neg_corr = corr.neg()
         NorMuonAndAdam._cautious_wd_and_update_inplace(
@@ -253,6 +224,7 @@ def _wr_locom_apply_mlp_chunk_corrections(optimizer, p_slice: Tensor, p_cfg, p_s
             WR_LOCOM_APPLY_STATS.append(
                 f"l{layer_idx}:base_step={float(base_step_norm):.3e}"
                 f",corr_norm={float(corr_norm):.3e},scale={float(scale):.3e}"
+                f",accepted_apply=1,cos_desc={float(cosine):.3f}"
             )
 
 @torch.no_grad()
@@ -263,29 +235,31 @@ def flush_wr_locoprop_m_apply_stats(step: int) -> None:
 
 class FusedLinearReLUSquareLocoMFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, W1, W2, layer_idx: int):
+    def forward(ctx, x, W1, W2, samples, layer_idx: int):
         pre, post = linear_relu_square(x.view((-1, x.shape[-1])), W1)
         y = post @ W2
-        ctx.save_for_backward(x, W1, W2, pre, post)
+        ctx.save_for_backward(x, W1, W2, pre, post, samples)
         ctx.layer_idx = int(layer_idx)
-        _wr_locom_capture_forward_sample(ctx.layer_idx, x, post)
         return y.view(x.shape)
 
     @staticmethod
     def backward(ctx, grad_output):
-        x, W1, W2, pre, post = ctx.saved_tensors
-        dW2 = post.T @ grad_output
-        dpre = linear_relu_square(grad_output.view((-1, grad_output.shape[-1])), W2, aux=pre)
-        _wr_locom_capture_backward_sample(ctx.layer_idx, dpre)
-        dW1 = dpre.T @ x
+        x, W1, W2, pre, post, samples = ctx.saved_tensors
+        flat_x = x.reshape(-1, x.shape[-1])
+        flat_grad = grad_output.reshape(-1, grad_output.shape[-1])
+        dW2 = post.T @ flat_grad
+        dpre = linear_relu_square(flat_grad, W2, aux=pre)
+        loco_capture(flat_x, pre, dpre, samples, ctx.layer_idx)
+        dW1 = dpre.T @ flat_x
         dx = dpre @ W1
-        return dx.view(x.shape), dW1, dW2, None
+        return dx.view(x.shape), dW1, dW2, None, None
 
 ReLUSqrdMLPLocoM = FusedLinearReLUSquareLocoMFunction.apply
 
 def _wr_locom_mlp(x: Tensor, W1: Tensor, W2: Tensor, layer_idx: int, training: bool) -> Tensor:
-    if training and _wr_locom_active(WR_LOCOM_CURRENT_STEP) and _wr_locom_layer_active(layer_idx):
-        return ReLUSqrdMLPLocoM(x, W1, W2, layer_idx)
+    # Static branch; active windows are read only by the opaque capture op.
+    if WR_LOCOM_ENABLED and _wr_locom_layer_active(layer_idx):
+        return ReLUSqrdMLPLocoM(x, W1, W2, WR_LOCOM_CAPTURE_BUFFERS[layer_idx], layer_idx)
     return ReLUSqrdMLP(x, W1, W2)
 '''
 
@@ -306,7 +280,7 @@ def generate(source: Path, output: Path, train_steps: int) -> None:
     text = replace_exact(
         text,
         "ReLUSqrdMLP = FusedLinearReLUSquareFunction.apply\nReLUSqrdMLPWithDiag = FusedLinearReLUSquareWithDiagFunction.apply\n",
-        "ReLUSqrdMLP = FusedLinearReLUSquareFunction.apply\nReLUSqrdMLPWithDiag = FusedLinearReLUSquareWithDiagFunction.apply\n" + WR_LOCOM_CONFIG,
+        "ReLUSqrdMLP = FusedLinearReLUSquareFunction.apply\nReLUSqrdMLPWithDiag = FusedLinearReLUSquareWithDiagFunction.apply\n" + SHARED_LOCAL_SOURCE + WR_LOCOM_CONFIG,
     )
     text = replace_exact(
         text,
@@ -347,8 +321,14 @@ def generate(source: Path, output: Path, train_steps: int) -> None:
     )
     text = replace_exact(
         text,
+        "        grad_chunk = grad_chunk.float()  # FP32 for momentum\n",
+        "        grad_chunk = grad_chunk.float()  # FP32 for momentum\n"
+        "        loco_raw_grad_chunk = grad_chunk.clone() if (WR_LOCOM_ENABLED and p_cfg.label == \"mlp_bank\" and _wr_locom_active(WR_LOCOM_CURRENT_STEP)) else None\n",
+    )
+    text = replace_exact(
+        text,
         "        return p_slice\n\n    def _loco_diag_col_update_fn(self):\n",
-        "        _wr_locom_apply_mlp_chunk_corrections(self, p_slice, p_cfg, p_state, v_chunk, rank)\n"
+        "        _wr_locom_apply_mlp_chunk_corrections(self, p_slice, p_cfg, p_state, v_chunk, rank, loco_raw_grad_chunk)\n"
         "        return p_slice\n\n    def _loco_diag_col_update_fn(self):\n",
     )
     text = replace_exact(
@@ -364,8 +344,9 @@ def generate(source: Path, output: Path, train_steps: int) -> None:
     text = replace_exact(
         text,
         "model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)\ntraining_manager = TrainingManager(model)\n",
-        "if WR_LOCOM_ENABLED and not _wr_locom_env_flag(\"WR_LOCOM_COMPILE\", \"0\"):\n"
-        "    print0(\"WR LocoProp-M: skipping torch.compile for Python-side sampled activation capture\", console=True)\n"
+        "initialize_wr_loco_capture(model)\n"
+        "if WR_LOCOM_ENABLED and not _wr_locom_env_flag(\"WR_LOCOM_COMPILE\", \"1\"):\n"
+        "    print0(\"WR LocoProp-M: eager model requested\", console=True)\n"
         "else:\n"
         "    model = torch.compile(model, dynamic=False, fullgraph=True)\n"
         "training_manager = TrainingManager(model)\n",
@@ -385,6 +366,17 @@ def generate(source: Path, output: Path, train_steps: int) -> None:
         "    console=True,\n"
         ")\n",
     )
+    text = text.replace(
+        "for idx in range(grad_accum_steps):\n",
+        "for idx in range(grad_accum_steps):\n" + "__LOCO_MICRO__\n",
+    )
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if line == "__LOCO_MICRO__":
+            previous = lines[index - 1]
+            indent = previous[:len(previous) - len(previous.lstrip())] + "    "
+            lines[index] = indent + "loco_set_microbatch(idx)"
+    text = "\n".join(lines) + "\n"
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(text)
 
