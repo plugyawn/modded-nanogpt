@@ -90,6 +90,81 @@ def test_post_step_gate_rejects_correction_after_outer_step_passed_local_minimum
     assert float(accepted) > 0 and float(rejected) == 0
 
 
+@pytest.mark.parametrize("target_space", ["pre", "post"])
+def test_cached_post_step_gate_matches_direct_trials(target_space):
+    torch.manual_seed(61)
+    x, pre, dpre = torch.randn(32, 5), torch.randn(32, 3), torch.randn(32, 3) * .03
+    for _ in range(8):
+        base, corr = torch.randn(3, 5) * .02, torch.randn(3, 5) * .1
+        bias = torch.randn(3) * .02
+        baseline = loco.loco_matching_objective(base, x, pre, dpre, 2., .1,
+                                                target_space, bias_delta=bias)
+        expected = torch.tensor(1.)
+        for index in range(13):
+            value = loco.loco_matching_objective(base + expected * corr, x, pre, dpre,
+                                                 2., .1, target_space, bias_delta=bias)
+            if torch.isfinite(value) and value < baseline:
+                break
+            expected *= .5
+        else:
+            expected.zero_()
+        actual, info = loco.loco_post_step_scale(corr, torch.tensor(1.), base, x, pre, dpre,
+                                                gamma=2., prox=.1, target_space=target_space,
+                                                max_backtracks=12, bias_delta=bias, return_info=True)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert info["attempts"] <= 13
+        if actual > 0:
+            assert info["final_checks"] >= 1 and info["reason"] == "accepted"
+
+
+def test_post_step_gate_accounts_for_outer_bias_update():
+    x, pre, dpre = torch.ones(1, 1), torch.ones(1, 1), torch.full((1, 1), .1)
+    corr, base = torch.tensor([[-.01]]), torch.zeros(1, 1)
+    assert loco.loco_post_step_scale(corr, torch.tensor(1.), base, x, pre, dpre) > 0
+    assert loco.loco_post_step_scale(corr, torch.tensor(1.), base, x, pre, dpre,
+                                    bias_delta=torch.tensor([-.1])) == 0
+
+
+@pytest.mark.parametrize("dtype,corr_value", [(torch.float32, -1e-10), (torch.bfloat16, -1e-4)])
+def test_post_step_gate_rejects_stored_dtype_noop(dtype, corr_value):
+    x, pre, dpre = torch.ones(1, 1), torch.ones(1, 1), torch.full((1, 1), .1)
+    current = torch.ones(1, 1, dtype=dtype)
+    scale, info = loco.loco_post_step_scale(torch.tensor([[corr_value]], dtype=dtype), torch.tensor(1.),
+                                           torch.zeros(1, 1), x, pre, dpre, current_weight=current,
+                                           reference_weight=current.float(), return_info=True)
+    assert scale == 0 and info["candidate"] is None and info["reason"] == "stored_noop"
+    assert info["final_checks"] == 0
+
+
+def test_post_step_gate_accepted_candidate_passes_actual_stored_objective():
+    x, pre, dpre = torch.ones(1, 1), torch.ones(1, 1), torch.full((1, 1), .1)
+    current = torch.ones(1, 1, dtype=torch.bfloat16)
+    scale, info = loco.loco_post_step_scale(torch.tensor([[-.01]], dtype=torch.bfloat16), torch.tensor(1.),
+                                           torch.zeros(1, 1), x, pre, dpre, current_weight=current,
+                                           reference_weight=current.float(), return_info=True)
+    assert scale > 0 and info["candidate"].dtype == current.dtype
+    expected = current.clone().add_(torch.tensor([[-.01]], dtype=torch.bfloat16), alpha=float(scale))
+    torch.testing.assert_close(info["candidate"], expected, rtol=0, atol=0)
+    assert loco.loco_matching_objective(expected.float() - current.float(), x, pre, dpre, 1., .1) < 0
+
+
+def test_exhausted_post_step_gate_projects_only_twice():
+    from torch.utils._python_dispatch import TorchDispatchMode
+    class CountMatmuls(TorchDispatchMode):
+        count = 0
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if func == torch.ops.aten.mm.default:
+                self.count += 1
+            return func(*args, **(kwargs or {}))
+    counter = CountMatmuls()
+    x, pre, dpre = torch.ones(1, 1), torch.ones(1, 1), torch.full((1, 1), .1)
+    with counter:
+        scale, info = loco.loco_post_step_scale(torch.tensor([[.01]]), torch.tensor(1.),
+                                               torch.zeros(1, 1), x, pre, dpre, return_info=True)
+    assert scale == 0 and info["attempts"] == 21 and info["backtracks"] == 20
+    assert counter.count == 2
+
+
 def test_accumulated_capture_is_compact_paired_and_does_not_change_rng():
     samples = loco.loco_sample_buffer(6, 1, 1)
     loco.loco_begin_capture(2, 3, True, {0})

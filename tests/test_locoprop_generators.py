@@ -114,6 +114,141 @@ def test_generated_mlp_and_solver_run_with_compilation(name, monkeypatch):
     assert correction.norm() <= .2 * .001 * update.norm() + 1e-6
 
 
+def test_record_rms_state_is_staged_and_only_committed_on_stored_update(monkeypatch):
+    monkeypatch.setenv("WR_LOCOM_LOCAL_OPT", "rmsprop")
+    monkeypatch.setenv("WR_LOCOM_SAMPLE_TOKENS", "2")
+    rt = runtime("make_wr_record_locoprop_m")
+    monkeypatch.setattr(rt.dist, "get_rank", lambda: 0)
+    model, block = nn.Module(), nn.Module()
+    block.mlp = rt.MLP(1)
+    model.blocks = nn.ModuleList([block])
+    layer = block.mlp
+    layer.fc.weight.data.fill_(1.)
+    layer.fc.bias.data.zero_()
+    for step, alpha in [(0, 1.), (1, 0.)]:
+        rt.WR_LOCOM_ALPHA = alpha
+        rt._wr_locom_begin_step(step)
+        x = torch.ones(2, 1)
+        pre = torch.nn.functional.linear(x, layer.fc.weight, layer.fc.bias)
+        dpre = torch.full_like(pre, .1)
+        loco.loco_capture(x, pre, dpre, layer._loco_samples, 0)
+        layer.fc.weight.grad = dpre.T @ x
+        old_avg, old_mom = layer._loco_rms_avg.clone(), layer._loco_rms_mom.clone()
+        rt.prepare_wr_locom_m(model, step)
+        assert rt.WR_LOCOM_CORR[0][-1] is not None
+        torch.testing.assert_close(layer._loco_rms_avg, old_avg, rtol=0, atol=0)
+        torch.testing.assert_close(layer._loco_rms_mom, old_mom, rtol=0, atol=0)
+        layer.fc.weight.data.sub_(.001)
+        before = layer.fc.weight.detach().clone()
+        rt.apply_wr_locom_m(model, None, step)
+        if alpha > 0:
+            assert not torch.equal(layer.fc.weight, before)
+            assert not torch.equal(layer._loco_rms_avg, old_avg)
+            assert not torch.equal(layer._loco_rms_mom, old_mom)
+            # The small FP32 update need not immediately change a BF16 forward.
+            assert "stored_corr=" in rt.WR_LOCOM_APPLY_STATS[0]
+            assert "gate_attempts=" in rt.WR_LOCOM_APPLY_STATS[0]
+        else:
+            torch.testing.assert_close(layer.fc.weight, before, rtol=0, atol=0)
+            torch.testing.assert_close(layer._loco_rms_avg, old_avg, rtol=0, atol=0)
+            torch.testing.assert_close(layer._loco_rms_mom, old_mom, rtol=0, atol=0)
+
+
+def test_record_rms_solver_honors_explicit_momentum_reset_and_decay(monkeypatch):
+    settings = {"WR_LOCOM_LOCAL_OPT": "rmsprop", "WR_LOCOM_RMS_BETA1": ".4",
+                "WR_LOCOM_RMS_BETA2": ".7", "WR_LOCOM_RMS_EPS": ".03",
+                "WR_LOCOM_RESET_RMS": "1", "WR_LOCOM_LR_DECAY": "1",
+                "WR_LOCOM_SAMPLE_TOKENS": "2", "WR_LOCOM_STEPS": "3"}
+    for name, value in settings.items():
+        monkeypatch.setenv(name, value)
+    rt = runtime("make_wr_record_locoprop_m")
+    monkeypatch.setattr(rt.dist, "get_rank", lambda: 0)
+    model, block = nn.Module(), nn.Module()
+    block.mlp = rt.MLP(1)
+    model.blocks = nn.ModuleList([block])
+    layer = block.mlp
+    layer._loco_rms_avg.fill_(.2)
+    layer._loco_rms_mom.fill_(.3)
+    rt._wr_locom_begin_step(0)
+    x, pre, dpre = torch.ones(2, 1), torch.ones(2, 4), torch.full((2, 4), .1)
+    loco.loco_capture(x, pre, dpre, layer._loco_samples, 0)
+    layer.fc.weight.grad = dpre.T @ x
+    expected, info, state = loco.loco_solve(x, pre, dpre, layer.fc.weight.grad, steps=3,
+                                           local_opt="rmsprop", rms_avg=layer._loco_rms_avg,
+                                           rms_mom=layer._loco_rms_mom, beta1=.4, beta2=.7,
+                                           rms_eps=.03, reset_rms=True, lr_decay=True)
+    assert info["accepted"]
+    rt.prepare_wr_locom_m(model, 0)
+    context = rt.WR_LOCOM_CORR[0]
+    torch.testing.assert_close(context[0], expected, rtol=0, atol=0)
+    for actual, wanted in zip(context[-1], state):
+        torch.testing.assert_close(actual, wanted, rtol=0, atol=0)
+    torch.testing.assert_close(layer._loco_rms_avg, torch.full_like(layer._loco_rms_avg, .2))
+    torch.testing.assert_close(layer._loco_rms_mom, torch.full_like(layer._loco_rms_mom, .3))
+
+
+@pytest.mark.parametrize("reason", ["stored_noop", "no_decrease"])
+def test_record_rejected_application_preserves_rms_state(monkeypatch, reason):
+    monkeypatch.setenv("WR_LOCOM_LOCAL_OPT", "rmsprop")
+    rt = runtime("make_wr_record_locoprop_m")
+    model, block = nn.Module(), nn.Module()
+    block.mlp = rt.MLP(1)
+    model.blocks = nn.ModuleList([block])
+    layer = block.mlp
+    layer.fc.weight.data.fill_(1.)
+    layer.fc.bias.data.zero_()
+    shape = layer.fc.weight.shape
+    x, pre, dpre = torch.ones(2, 1), torch.ones(2, shape[0]), torch.full((2, shape[0]), .1)
+    corr = torch.full(shape, -1e-10 if reason == "stored_noop" else .01)
+    reference = torch.full(shape, .99)
+    staged = (torch.full(shape, .3), torch.full(shape, .4))
+    rt.WR_LOCOM_CORR[0] = (corr, reference, x, pre, dpre, torch.zeros(shape[0]), staged)
+    before = layer.fc.weight.detach().clone()
+    rt.apply_wr_locom_m(model, None, 0)
+    torch.testing.assert_close(layer.fc.weight, before, rtol=0, atol=0)
+    assert torch.count_nonzero(layer._loco_rms_avg) == torch.count_nonzero(layer._loco_rms_mom) == 0
+    assert "accepted_apply=0" in rt.WR_LOCOM_APPLY_STATS[0]
+    assert f"gate_reason={reason}" in rt.WR_LOCOM_APPLY_STATS[0]
+
+
+def test_record_local_optimizer_defaults_and_validation(monkeypatch):
+    monkeypatch.delenv("WR_LOCOM_LOCAL_OPT", raising=False)
+    rt = runtime("make_wr_record_locoprop_m")
+    assert rt.WR_LOCOM_LOCAL_OPT == "sgd"
+    mlp = rt.MLP(1)
+    assert mlp._loco_rms_avg is None and mlp._loco_rms_mom is None
+    monkeypatch.setenv("WR_LOCOM_LOCAL_OPT", "invalid")
+    with pytest.raises(ValueError, match="WR_LOCOM_LOCAL_OPT"):
+        runtime("make_wr_record_locoprop_m")
+
+
+@pytest.mark.parametrize("enabled,layers", [("0", "all"), ("1", "none")])
+def test_record_disabled_mlp_has_no_capture_storage_and_native_gradients(monkeypatch, enabled, layers):
+    import copy
+    monkeypatch.setenv("WR_LOCOM_ENABLED", enabled)
+    monkeypatch.setenv("WR_LOCOM_LAYERS", layers)
+    rt = runtime("make_wr_record_locoprop_m")
+    class ForbiddenCapture:
+        @staticmethod
+        def apply(*args):
+            raise AssertionError("native baseline must not call custom capture backward")
+    rt.LocoMLPFunction = ForbiddenCapture
+    mlp = rt.MLP(3)
+    native = copy.deepcopy(mlp)
+    assert mlp._loco_samples is None and mlp._loco_rms_avg is None and mlp._loco_rms_mom is None
+    x = torch.randn(2, 4, 3).bfloat16().requires_grad_()
+    nx = x.detach().clone().requires_grad_()
+    out = mlp(x)
+    expected = native.proj(native.fc(nx).relu().square())
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    dy = torch.randn_like(out)
+    out.backward(dy)
+    expected.backward(dy)
+    torch.testing.assert_close(x.grad, nx.grad, rtol=0, atol=0)
+    for actual, reference in zip(mlp.parameters(), native.parameters()):
+        torch.testing.assert_close(actual.grad, reference.grad, rtol=0, atol=0)
+
+
 def test_newton_muon_covariance_hooks_and_capture_survive_compiled_model(monkeypatch, tmp_path):
     monkeypatch.setenv("TRACK3_LOCOM_SAMPLE_TOKENS", "8")
     rt = runtime("make_track3_locoprop_m")

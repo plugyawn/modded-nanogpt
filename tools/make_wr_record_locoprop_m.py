@@ -74,6 +74,17 @@ WR_LOCOM_LOG_STEPS = {
 
 WR_LOCOM_MAX_BACKTRACKS = int(os.environ.get("WR_LOCOM_MAX_BACKTRACKS", "20"))
 WR_LOCOM_ACCUM_SAMPLES = _wr_locom_flag("WR_LOCOM_ACCUM_SAMPLES", "1")
+WR_LOCOM_LOCAL_OPT = os.environ.get("WR_LOCOM_LOCAL_OPT", "sgd").lower()
+if WR_LOCOM_LOCAL_OPT not in {"sgd", "rmsprop"}:
+    raise ValueError("WR_LOCOM_LOCAL_OPT must be 'sgd' or 'rmsprop'")
+WR_LOCOM_RMS_BETA1 = float(os.environ.get("WR_LOCOM_RMS_BETA1", "0.999"))
+WR_LOCOM_RMS_BETA2 = float(os.environ.get("WR_LOCOM_RMS_BETA2", "0.9"))
+WR_LOCOM_RMS_EPS = float(os.environ.get("WR_LOCOM_RMS_EPS", "1e-5"))
+WR_LOCOM_RMS_STYLE = os.environ.get("WR_LOCOM_RMS_STYLE", "torch").lower()
+if WR_LOCOM_RMS_STYLE not in {"torch", "tensorflow"}:
+    raise ValueError("WR_LOCOM_RMS_STYLE must be 'torch' or 'tensorflow'")
+WR_LOCOM_RESET_RMS = _wr_locom_flag("WR_LOCOM_RESET_RMS", "0")
+WR_LOCOM_LR_DECAY = _wr_locom_flag("WR_LOCOM_LR_DECAY", "0")
 
 WR_LOCOM_CURRENT_STEP = -1
 WR_LOCOM_NEXT_LAYER = 0
@@ -122,16 +133,23 @@ def prepare_wr_locom_m(model: nn.Module, step: int) -> None:
             continue
         x, pre0, dpre = _wr_locom_gather(sx), _wr_locom_gather(sp), _wr_locom_gather(sg)
         raw_grad = layer.fc.weight.grad
-        corr, diag, _ = loco_solve(
+        corr, diag, staged_rms = loco_solve(
             x, pre0, dpre, raw_grad, steps=WR_LOCOM_STEPS,
             inner_lr=WR_LOCOM_INNER_LR, gamma=WR_LOCOM_TARGET_GAMMA,
             prox=WR_LOCOM_PROX, min_cos=WR_LOCOM_MIN_COS_DESC,
             require_decrease=WR_LOCOM_REQUIRE_LOSS_DECREASE,
             max_backtracks=WR_LOCOM_MAX_BACKTRACKS, output_dtype=layer.fc.weight.dtype,
+            local_opt=WR_LOCOM_LOCAL_OPT, rms_avg=layer._loco_rms_avg,
+            rms_mom=layer._loco_rms_mom, beta1=WR_LOCOM_RMS_BETA1,
+            beta2=WR_LOCOM_RMS_BETA2, rms_eps=WR_LOCOM_RMS_EPS,
+            reset_rms=WR_LOCOM_RESET_RMS, lr_decay=WR_LOCOM_LR_DECAY,
+            rms_style=WR_LOCOM_RMS_STYLE,
         )
         if diag["accepted"]:
-            WR_LOCOM_CORR[layer_idx] = (corr, layer.fc.weight.detach().float().clone(), x, pre0, dpre)
-        if step in WR_LOCOM_LOG_STEPS and len(stats) < 8:
+            bias_reference = layer.fc.bias.detach().float().clone() if layer.fc.bias is not None else None
+            WR_LOCOM_CORR[layer_idx] = (corr, layer.fc.weight.detach().float().clone(),
+                                       x, pre0, dpre, bias_reference, staged_rms)
+        if step in WR_LOCOM_LOG_STEPS:
             stats.append(
                 f"l{layer_idx}:loss0={diag['loss0']:.3e},lossK={diag['lossK']:.3e}"
                 f",corr={float(corr.float().norm()):.3e}"
@@ -148,7 +166,7 @@ def apply_wr_locom_m(model: nn.Module, optimizer: torch.optim.Optimizer, step: i
     if not _wr_locom_active(step):
         return
     for layer_idx, context in sorted(WR_LOCOM_CORR.items()):
-        corr, reference, x, pre0, dpre = context
+        corr, reference, x, pre0, dpre, bias_reference, staged_rms = context
         layer = model.blocks[layer_idx].mlp
         p = layer.fc.weight
         corr_f = corr.float()
@@ -157,17 +175,32 @@ def apply_wr_locom_m(model: nn.Module, optimizer: torch.optim.Optimizer, step: i
         # their actual displacement; only the owner has the optimizer's state.
         base_delta = p.float() - reference
         base_step_norm = base_delta.norm()
+        bias_delta = layer.fc.bias.float() - bias_reference if bias_reference is not None else None
         scale = loco_correction_scale(corr, base_step_norm, alpha=WR_LOCOM_ALPHA,
                                      cap=WR_LOCOM_NORM_CAP, norm_to_base=WR_LOCOM_NORM_TO_BASE)
-        scale = loco_post_step_scale(corr, scale, base_delta, x, pre0, dpre,
-                                    gamma=WR_LOCOM_TARGET_GAMMA, prox=WR_LOCOM_PROX,
-                                    max_backtracks=WR_LOCOM_MAX_BACKTRACKS)
-        if float(scale) > 0:
-            p.add_(corr, alpha=float(scale))
-        if step in WR_LOCOM_LOG_STEPS and len(WR_LOCOM_APPLY_STATS) < 8:
+        scale, gate = loco_post_step_scale(corr, scale, base_delta, x, pre0, dpre,
+                                          gamma=WR_LOCOM_TARGET_GAMMA, prox=WR_LOCOM_PROX,
+                                          max_backtracks=WR_LOCOM_MAX_BACKTRACKS,
+                                          bias_delta=bias_delta, current_weight=p,
+                                          reference_weight=reference, return_info=True)
+        applied = gate["candidate"] is not None
+        logged = step in WR_LOCOM_LOG_STEPS
+        stored_norm, bf16_fraction = 0.0, 0.0
+        if applied:
+            candidate = gate["candidate"]
+            if logged:
+                stored_norm = float((candidate.float() - p.float()).norm())
+                bf16_fraction = float((candidate.bfloat16() != p.bfloat16()).float().mean())
+            p.copy_(candidate)
+            if staged_rms is not None:
+                layer._loco_rms_avg.copy_(staged_rms[0])
+                layer._loco_rms_mom.copy_(staged_rms[1])
+        if logged:
             WR_LOCOM_APPLY_STATS.append(
                 f"l{layer_idx}:base={float(base_step_norm):.3e},corr={float(corr_norm):.3e},scale={float(scale):.3e}"
-                f",accepted_apply={int(float(scale) > 0)}"
+                f",accepted_apply={int(applied)},stored_corr={stored_norm:.3e},bf16_changed={bf16_fraction:.6f}"
+                f",gate_attempts={gate['attempts']},gate_backtracks={gate['backtracks']}"
+                f",gate_final_checks={gate['final_checks']},gate_reason={gate['reason']}"
             )
     WR_LOCOM_CORR.clear()
     if step in WR_LOCOM_LOG_STEPS and WR_LOCOM_APPLY_STATS:
@@ -186,8 +219,13 @@ MLP_BLOCK = r'''class MLP(nn.Module):
         self.fc = Linear(dim, hdim)
         self.proj = Linear(hdim, dim)
         world = dist.get_world_size() if dist.is_initialized() else 1
-        rows = WR_LOCOM_SAMPLE_TOKENS if self.wr_locom_layer_enabled else 1
-        self.register_buffer("_loco_samples", loco_sample_buffer(rows, dim, hdim, world), persistent=False)
+        samples = loco_sample_buffer(WR_LOCOM_SAMPLE_TOKENS, dim, hdim, world) if self.wr_locom_layer_enabled else None
+        self.register_buffer("_loco_samples", samples, persistent=False)
+        rms_enabled = self.wr_locom_layer_enabled and WR_LOCOM_LOCAL_OPT == "rmsprop"
+        rms_initial = (torch.ones_like(self.fc.weight, dtype=torch.float32) if WR_LOCOM_RMS_STYLE == "tensorflow"
+                       else torch.zeros_like(self.fc.weight, dtype=torch.float32)) if rms_enabled else None
+        self.register_buffer("_loco_rms_avg", rms_initial)
+        self.register_buffer("_loco_rms_mom", torch.zeros_like(self.fc.weight, dtype=torch.float32) if rms_enabled else None)
 
     def forward(self, x: Tensor):
         if self.wr_locom_layer_enabled:
@@ -280,7 +318,9 @@ def generate(source: Path, output: Path, train_steps: int, schedule_steps: int |
         "    f\"windows={WR_LOCOM_ACTIVE_WINDOWS or [(WR_LOCOM_START_STEP, WR_LOCOM_END_STEP)]} \"\n"
         "    f\"K={WR_LOCOM_STEPS} sample_tokens={WR_LOCOM_SAMPLE_TOKENS} inner_lr={WR_LOCOM_INNER_LR} \"\n"
         "    f\"prox={WR_LOCOM_PROX} alpha={WR_LOCOM_ALPHA} norm_cap={WR_LOCOM_NORM_CAP} \"\n"
-        "    f\"norm_to_base={WR_LOCOM_NORM_TO_BASE} min_cos={WR_LOCOM_MIN_COS_DESC}\",\n"
+        "    f\"norm_to_base={WR_LOCOM_NORM_TO_BASE} min_cos={WR_LOCOM_MIN_COS_DESC} \"\n"
+        "    f\"local_opt={WR_LOCOM_LOCAL_OPT} rms_beta1={WR_LOCOM_RMS_BETA1} rms_beta2={WR_LOCOM_RMS_BETA2} \"\n"
+        "    f\"rms_eps={WR_LOCOM_RMS_EPS} rms_style={WR_LOCOM_RMS_STYLE} reset_rms={WR_LOCOM_RESET_RMS} lr_decay={WR_LOCOM_LR_DECAY}\",\n"
         "    console=True,\n"
         ")\n"
         "print0(\"=\"*100)\n\nval_tokens = 20 * 524288\n",

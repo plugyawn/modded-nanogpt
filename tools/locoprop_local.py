@@ -135,14 +135,8 @@ class LocoReLUSquareFunction(torch.autograd.Function):
         return None, dpre, None, None
 
 
-def loco_matching_objective(delta, x, pre0, dpre, gamma, prox, target_space="post"):
-    """Actual regularized matching objective, relative to its value at delta=0.
-
-    Anchoring at the captured preactivation eliminates BF16/FP32 replay error.
-    The piecewise Bregman remainder avoids subtracting large cubic potentials.
-    Feature dimensions are summed, rows averaged, matching err.T @ x / N.
-    """
-    change = x @ delta.mT
+def _loco_matching_value(change, pre0, dpre, gamma, regularizer, target_space="post"):
+    """Matching value from a projected affine displacement and its penalty."""
     z = pre0 + change
     if target_space == "pre":
         remainder = 0.5 * change.square()
@@ -154,8 +148,23 @@ def loco_matching_objective(delta, x, pre0, dpre, gamma, prox, target_space="pos
                                 z.clamp_min(0).pow(3) / 3)
     else:
         raise ValueError("target_space must be 'pre' or 'post'")
-    return ((remainder + gamma * dpre * change).sum(dtype=torch.float64) / x.shape[0]
-            + 0.5 * prox * delta.square().sum(dtype=torch.float64))
+    return ((remainder + gamma * dpre * change).sum(dtype=torch.float64) / change.shape[0]
+            + regularizer)
+
+
+def loco_matching_objective(delta, x, pre0, dpre, gamma, prox, target_space="post", bias_delta=None):
+    """Actual regularized matching objective, relative to its value at delta=0.
+
+    Anchoring at the captured preactivation eliminates BF16/FP32 replay error.
+    The piecewise Bregman remainder avoids subtracting large cubic potentials.
+    Feature dimensions are summed, rows averaged, matching err.T @ x / N.
+    """
+    change = x @ delta.mT
+    if bias_delta is not None:
+        change = change + bias_delta.float()
+    # The unchanged bias penalty would cancel between post-step candidates.
+    return _loco_matching_value(change, pre0, dpre, gamma,
+                                0.5 * prox * delta.square().sum(dtype=torch.float64), target_space)
 
 
 @torch.no_grad()
@@ -163,7 +172,8 @@ def loco_solve(x, pre0, dpre, raw_grad, *, steps=4, inner_lr=0.1, gamma=1.0,
                prox=0.1, target_space="post", min_cos=0.0, require_decrease=True,
                max_backtracks=20, armijo=1e-4, output_dtype=torch.float32,
                local_opt="sgd", rms_avg=None, rms_mom=None, beta1=0.999,
-               beta2=0.9, rms_eps=1e-5, reset_rms=False, lr_decay=False):
+               beta2=0.9, rms_eps=1e-5, reset_rms=False, lr_decay=False,
+               rms_style="torch"):
     if steps < 0 or max_backtracks < 0:
         raise ValueError("steps and max_backtracks must be nonnegative")
     if not all(math.isfinite(v) for v in (inner_lr, gamma, prox, armijo, rms_eps)):
@@ -172,6 +182,8 @@ def loco_solve(x, pre0, dpre, raw_grad, *, steps=4, inner_lr=0.1, gamma=1.0,
         raise ValueError("invalid LocoProp learning rate, target, proximal term or Armijo coefficient")
     if local_opt not in {"sgd", "rmsprop"}:
         raise ValueError("local_opt must be 'sgd' or 'rmsprop'")
+    if rms_style not in {"torch", "tensorflow"}:
+        raise ValueError("rms_style must be 'torch' or 'tensorflow'")
     if not (0 <= beta1 < 1 and 0 <= beta2 < 1 and rms_eps > 0):
         raise ValueError("invalid RMSProp settings")
     if x.ndim != 2 or pre0.ndim != 2 or pre0.shape != dpre.shape or x.shape[0] != pre0.shape[0]:
@@ -187,12 +199,17 @@ def loco_solve(x, pre0, dpre, raw_grad, *, steps=4, inner_lr=0.1, gamma=1.0,
         info["reason"] = "nonfinite_input"
         return delta.to(output_dtype), info, None
     avg = mom = None
+    tensorflow_rms = local_opt == "rmsprop" and rms_style == "tensorflow"
     if local_opt == "rmsprop":
-        avg = torch.zeros_like(delta) if rms_avg is None or reset_rms else rms_avg.float().clone()
+        if rms_avg is None or reset_rms:
+            avg = torch.ones_like(delta) if tensorflow_rms else torch.zeros_like(delta)
+        else:
+            avg = rms_avg.float().clone()
         mom = torch.zeros_like(delta) if rms_mom is None or reset_rms else rms_mom.float().clone()
     value = loco_matching_objective(delta, x, pre0, dpre, gamma, prox, target_space)
     initial_post = pre0.relu().square()
     trial_lr = inner_lr
+    tensorflow_backtrack_factor = 1.0
     for index in range(steps):
         change = x @ delta.mT
         residual = (change if target_space == "pre" else
@@ -206,26 +223,47 @@ def loco_solve(x, pre0, dpre, raw_grad, *, steps=4, inner_lr=0.1, gamma=1.0,
         next_avg, next_mom, direction = avg, mom, grad
         if local_opt == "rmsprop":
             next_avg = beta2 * avg + (1 - beta2) * grad.square()
-            next_mom = beta1 * mom + grad / (next_avg.sqrt() + rms_eps)
-            direction = next_mom
-        slope = (grad * direction).sum(dtype=torch.float64)
-        if not bool(torch.isfinite(slope)) or float(slope) <= 0:
-            direction, slope = grad, grad.square().sum(dtype=torch.float64)
-            next_mom = grad.clone()
-        lr = trial_lr
-        if lr_decay:
-            lr *= max(1 - index / max(steps, 1), 0.25)
+            if tensorflow_rms:
+                normalized_grad = grad / (next_avg + rms_eps).sqrt()
+            else:
+                next_mom = beta1 * mom + grad / (next_avg.sqrt() + rms_eps)
+                direction = next_mom
+        if not tensorflow_rms:
+            slope = (grad * direction).sum(dtype=torch.float64)
+            if not bool(torch.isfinite(slope)) or float(slope) <= 0:
+                direction, slope = grad, grad.square().sum(dtype=torch.float64)
+                next_mom = grad.clone()
+        decay_fraction = max(1 - index / max(steps, 1), 0.25) if lr_decay else 1.0
+        # TF's momentum slot stores the LR-weighted displacement. Its local
+        # decay is relative to the reference LR, with backtracking independent
+        # of the preceding iteration's decay. Keep the legacy torch path intact.
+        lr = (inner_lr * tensorflow_backtrack_factor if tensorflow_rms else trial_lr) * decay_fraction
         found = False
         for _ in range(max_backtracks + 1):
-            candidate = delta - lr * direction
+            if tensorflow_rms:
+                # Recompute from the original momentum for each trial LR;
+                # rejected trials must not accumulate momentum or slot decay.
+                next_mom = beta1 * mom + lr * normalized_grad
+                displacement_slope = (grad * next_mom).sum(dtype=torch.float64)
+                if not bool(torch.isfinite(displacement_slope)) or float(displacement_slope) <= 0:
+                    next_mom = lr * grad
+                    displacement_slope = (grad * next_mom).sum(dtype=torch.float64)
+                candidate = delta - next_mom
+                decrease_bound = value - armijo * displacement_slope
+            else:
+                candidate = delta - lr * direction
+                decrease_bound = value - armijo * lr * slope
             candidate_value = loco_matching_objective(candidate, x, pre0, dpre, gamma, prox, target_space)
-            if bool(torch.isfinite(candidate_value)) and bool(candidate_value <= value - armijo * lr * slope):
+            if bool(torch.isfinite(candidate_value)) and bool(candidate_value <= decrease_bound):
                 delta, value = candidate, candidate_value
                 avg, mom = next_avg, next_mom
                 found = True
                 info["local_steps"] += 1
                 info["inner_lr"] = lr
-                trial_lr = lr
+                if tensorflow_rms:
+                    tensorflow_backtrack_factor = lr / (inner_lr * decay_fraction)
+                else:
+                    trial_lr = lr
                 break
             lr *= 0.5
             info["backtracks"] += 1
@@ -272,18 +310,67 @@ def loco_correction_scale(corr, base_norm, *, alpha=1.0, cap=0.2,
 
 @torch.no_grad()
 def loco_post_step_scale(corr, scale, base_delta, x, pre0, dpre, *, gamma=1.0,
-                         prox=0.1, target_space="post", max_backtracks=20):
-    """Accept the capped correction at the weights the outer step actually reached."""
+                         prox=0.1, target_space="post", max_backtracks=20,
+                         bias_delta=None, current_weight=None, reference_weight=None,
+                         return_info=False):
+    """Gate at the outer step's affine state, including its native bias update.
+
+    Project the base and correction once for scalar backtracking. An apparently
+    successful trial is then checked using the actual stored-dtype addition and
+    a fresh projection, so caching cannot admit a rounded no-op or false decrease.
+    Optional current/reference weights model parameter rounding exactly; callers
+    requesting diagnostics receive the verified candidate for an exact copy.
+    """
+    if max_backtracks < 0:
+        raise ValueError("max_backtracks must be nonnegative")
+    if (current_weight is None) != (reference_weight is None):
+        raise ValueError("current_weight and reference_weight must be supplied together")
+    info = dict(attempts=0, backtracks=0, final_checks=0, reason="disabled", candidate=None)
+    def result(accepted_scale):
+        return (accepted_scale, info) if return_info else accepted_scale
+    zero = scale.new_zeros(())
+    if float(scale) <= 0:
+        return result(zero)
     x, pre0, dpre = x.float(), pre0.float(), dpre.float()
-    baseline = loco_matching_objective(base_delta, x, pre0, dpre, gamma, prox, target_space)
+    stored_corr = corr
+    base_delta, corr = base_delta.float(), corr.float()
+    base_change, corr_change = x @ base_delta.mT, x @ corr.mT
+    if bias_delta is not None:
+        base_change = base_change + bias_delta.float()
+    base_sq = base_delta.square().sum(dtype=torch.float64)
+    cross = (base_delta * corr).sum(dtype=torch.float64)
+    corr_sq = corr.square().sum(dtype=torch.float64)
+    baseline = _loco_matching_value(base_change, pre0, dpre, gamma, 0.5 * prox * base_sq, target_space)
     if not bool(torch.isfinite(baseline)):
-        return scale.new_zeros(())
-    for _ in range(max_backtracks + 1):
-        if float(scale) <= 0:
-            break
-        combined = base_delta + scale * corr.float()
-        value = loco_matching_objective(combined, x, pre0, dpre, gamma, prox, target_space)
+        info["reason"] = "nonfinite_baseline"
+        return result(zero)
+    for index in range(max_backtracks + 1):
+        info["attempts"] += 1
+        regularizer = 0.5 * prox * (base_sq + 2 * scale.double() * cross + scale.double().square() * corr_sq)
+        value = _loco_matching_value(base_change + scale * corr_change, pre0, dpre,
+                                     gamma, regularizer, target_space)
         if bool(torch.isfinite(value)) and bool(value < baseline):
-            return scale
+            if current_weight is not None:
+                candidate = current_weight.detach().clone()
+                candidate.add_(stored_corr, alpha=float(scale))
+                unchanged = bool(torch.equal(candidate, current_weight))
+                combined = candidate.float() - reference_weight.float()
+            else:
+                candidate = None
+                combined = base_delta + scale * corr
+                unchanged = bool(torch.equal(combined, base_delta))
+            if unchanged:
+                # All smaller positive scales are also below storage precision.
+                info["reason"] = "stored_noop"
+                return result(zero)
+            info["final_checks"] += 1
+            exact_value = loco_matching_objective(combined, x, pre0, dpre, gamma, prox,
+                                                   target_space, bias_delta=bias_delta)
+            if bool(torch.isfinite(exact_value)) and bool(exact_value < baseline):
+                info.update(reason="accepted", candidate=candidate)
+                return result(scale)
+        if index < max_backtracks:
+            info["backtracks"] += 1
         scale = scale * 0.5
-    return scale.new_zeros(())
+    info["reason"] = "no_decrease"
+    return result(zero)
