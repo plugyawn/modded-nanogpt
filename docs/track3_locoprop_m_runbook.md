@@ -355,10 +355,27 @@ optimizer can already move beyond the local target, causing the application gate
 to reject an otherwise accepted inner solve. A stable local solve alone does not
 justify larger additive corrections.
 
-A full 3040-step comparison is running with the same seed/source/data revision
+A full 3040-step comparison completed with the same seed/source/data revision
 and schedule, CUDA 12.8, samples 8192, gamma 100, cap 0.05, and alpha 0 versus 1.
-Two independent H100 SXM5 allocations run concurrently. Full results are pending;
-single-seed screens must not be presented as a record or statistically established
-improvement. Controller artifacts live outside the repository in
-`../experiments`, including the full configuration, resource ledger, result
-checksums, and automatic collection/termination supervisor.
+Two independent H100 SXM5 allocations ran concurrently. Both exited successfully,
+without OOM or nonfinite loss, and peaked at 31.31 GB allocated / 34.38 GB reserved.
+
+| Arm | Final validation loss | Training seconds | Average step ms |
+| --- | --- | --- | --- |
+| Alpha 0 control, capture/solve enabled | 3.27925 | 6190.031 | 2036.19 |
+| Alpha 1 repaired correction | 3.27894 | 8026.607 | 2640.33 |
+
+The correction finished 0.00031 lower in loss, with 29.67% more training time.
+This one-seed difference is too small to establish a useful quality advantage.
+The result validates full-run numerical stability for this configuration; it does
+not establish multi-GPU stability, statistical significance, or a record. The
+control includes capture/solver overhead, so these times do not measure total
+overhead against the unmodified record optimizer.
+
+Results and provenance are summarized in `docs/locoprop_gpu_validation_20261006.json`.
+The supervisor collected SHA256-verified logs/generated scripts and confirmed both
+task-owned allocations were `TERMINATED`. Estimated total compute cost, conservatively
+using creation-to-termination time, was $22.05; this is not an invoice. No resumable
+checkpoint or model export was configured for the full comparison. Controller
+artifacts live outside the repository in `../experiments`, including the full
+configuration, resource ledger, result archives, and termination confirmations.
