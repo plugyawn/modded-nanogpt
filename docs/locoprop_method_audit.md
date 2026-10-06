@@ -212,3 +212,69 @@ The most informative sequence is a matched simple-Muon comparison, an inner
 SGD/RMSProp ablation, then selected optimizer-replacement and broader-coverage
 experiments. A claim about LocoProp functioning independently needs replacement
 experiments, not only additive improvements over Muon.
+
+## CUDA trajectory differences and checkpoint restoration are separate checks
+
+In the October 6 CUDA checkpoint diagnostic, two independent runs already
+differed at step 10, before either resumed. Matching script/configuration and
+data hashes, loader positions, and random-generator states therefore do not
+make the subsequent trajectory comparison an isolated test of serialization.
+An exact fresh-process load/save comparison should check restoration of model,
+optimizer, local solver, loader, counter, and RNG state before further training.
+Deterministic training comparisons are a separate diagnostic. Neither check
+requires changing the production May arithmetic.
+
+There is a concrete potential source of native compiled nondeterminism in
+PyTorch 2.11. The generated May driver uses `model.compile(dynamic=False)` and
+a BF16 `nn.Embedding`. Inductor registers the ordinary
+[`embedding_dense_backward` decomposition](https://github.com/pytorch/pytorch/blob/v2.11.0/torch/_inductor/decomposition.py#L148-L163).
+That decomposition promotes BF16 contributions to FP32, accumulates repeated
+token indices through `_unsafe_index_put(..., accumulate=True)`, and casts the
+result back to BF16
+([decomposition](https://github.com/pytorch/pytorch/blob/v2.11.0/torch/_decomp/decompositions.py#L1278-L1306),
+[promotion](https://github.com/pytorch/pytorch/blob/v2.11.0/torch/_prims_common/__init__.py#L1487-L1493)).
+The Inductor indexing lowering normally emits an `atomic_add` scatter and
+instead selects a fallback when deterministic algorithms are enabled
+([deterministic branch](https://github.com/pytorch/pytorch/blob/v2.11.0/torch/_inductor/lowering.py#L4066-L4068),
+[atomic scatter](https://github.com/pytorch/pytorch/blob/v2.11.0/torch/_inductor/lowering.py#L4126-L4133)).
+This is FP32 accumulation with BF16 output storage, not direct BF16 atomic
+addition. Floating-point addition depends on reduction order; contributions
+to repeated tokens can consequently vary without consuming random numbers.
+Generated-kernel inspection or repeated isolated backward calls would be
+needed to establish which kernel actually caused the observed difference.
+
+This distinction matters because eager CUDA embedding uses a different
+algorithm selector. Its optional atomic path requires a small scatter grid
+relative to the device and is disabled by deterministic mode
+([selector](https://github.com/pytorch/pytorch/blob/v2.11.0/aten/src/ATen/native/cuda/EmbeddingBackwardKernel.cu#L369-L381)).
+For the full May microbatch of 65,536 token indices, vocabulary 50,304 and
+dimension 768, this selector produces a grid of 50,304, which fails that
+small-grid condition on an H100. The existence of an eager atomic kernel alone
+would therefore be insufficient evidence for blaming it in this experiment.
+
+May's BF16 embedding AdamW moments are also native:
+[`Adam` initializes moments with `zeros_like(parameter)`](https://github.com/pytorch/pytorch/blob/v2.11.0/torch/optim/adam.py#L177-L184).
+The fused CUDA update computes parameter and moment arithmetic in its opmath
+type, uses `sqrt(v)/sqrt(bias_correction2) + eps`, then stores parameter and
+moments back in their storage type
+([fused arithmetic](https://github.com/pytorch/pytorch/blob/v2.11.0/aten/src/ATen/native/cuda/fused_adam_utils.cuh#L42-L88)).
+BF16 moment storage is not evidence of a checkpoint dtype regression.
+
+The embedding learning rate 0.3 and epsilon \(10^{-10}\) are plausible
+amplifiers of a small difference, not a demonstrated cause of instability.
+For a fresh scalar Adam state without weight decay, the bias-corrected update
+is \(-\eta g/(|g|+\epsilon)\). Its sensitivity near zero is
+\(\eta/\epsilon\), or \(3\times10^9\) at the base embedding rate. Sensitivity
+falls away from zero, and many reduction differences round to the same BF16
+value; crossing a BF16 rounding boundary can instead create different stored
+states that later training amplifies. This reasoning does not quantify the
+effect in the measured run or establish that Adam itself introduces randomness.
+
+For diagnostic runs, `torch.use_deterministic_algorithms(True)` should be set
+before compilation. Besides the indexing fallback, PyTorch 2.11 uses this
+setting to suppress Inductor benchmarking choices that can change reduction
+numerics. Unsupported deterministic operations can raise, and the flag alone
+does not guarantee application-wide reproducibility
+([official contract](https://docs.pytorch.org/docs/2.11/generated/torch.use_deterministic_algorithms.html)).
+The production baseline should retain its original compiled kernels and
+optimizer settings so that these diagnostics do not silently redefine it.

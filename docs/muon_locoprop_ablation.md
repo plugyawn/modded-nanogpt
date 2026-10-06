@@ -68,8 +68,11 @@ position restores directly, preserving the native shard-tail rule without
 replaying or transferring old batches. Model compilation may run again after a
 restart; this mechanism preserves state and RNG but does not promise bitwise
 CUDA replay on nondeterministic kernels or across runtime/hardware changes.
-Checkpoint IO is excluded from the record's training-time metric. Archive the
-checkpoint before deleting an ephemeral GPU allocation.
+Checkpoint IO is excluded from the record's training-time metric. Before deleting
+an ephemeral GPU allocation, preserve requested recovery checkpoints or explicitly
+record their intentional discard under the agreed retention policy. The October 6
+pool keeps the last two checkpoints on active GPUs only; its local archives retain
+metrics, configurations, generated code, provenance, and checkpoint checksums.
 
 `--checkpoint-stop-file /absolute/path/to/checkpoint_stop.request` lets a budget
 supervisor request a current recovery point. After observing that marker at the
@@ -108,3 +111,27 @@ This partial replacement is not a complete paper implementation of LocoProp.
 An additive result tests an extra local correction on top of Muon; a replacement
 pilot tests one subset of local weight updates. Multiple matched seeds are needed
 before treating small validation-loss differences as evidence of a benefit.
+
+## October 6 admission evidence
+
+All twelve 125-update pilots completed with finite validation loss on a pinned
+single-H100, PyTorch 2.11/CUDA 12.8 runtime. Against their matching capture-and-solve
+controls, RMSProp10 additive corrections changed validation loss by -0.00381 for
+simple Muon and -0.00491 for May9; SGD4 changed it by +0.00267 and +0.00765. RMSProp
+additive arms remained slightly worse than their native timing arms at this early
+step. These are exploratory single-seed observations, not evidence of a full-run
+quality gain. Exact configurations, timings and verified archive checksums are in
+[`locoprop_pilots_20261006.json`](locoprop_pilots_20261006.json).
+
+A fresh CUDA process restored all 586 model/optimizer/local-solver state tensors
+bitwise, together with loader position, RNG and counters. Independent compiled
+training trajectories already differed before a resume, so those trajectories
+do not provide an isolated checkpoint serialization test. See the
+[`method audit`](locoprop_method_audit.md#cuda-trajectory-differences-and-checkpoint-restoration-are-separate-checks).
+
+The frozen full queue contains twelve 3040-update initial arms, eight additional
+RMSProp/control arms for seeds 3711 and 3712, and fourteen single-component
+RMSProp/control arms. These retain the 3105-update learning-rate schedule. Seed
+replications are descriptive; the seven component comparisons remain exploratory.
+The queue runs only within the authorized total compute budget, so every planned
+arm must retain its actual completion, interruption or unstarted status.
