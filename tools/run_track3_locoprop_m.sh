@@ -21,7 +21,13 @@ generated_sha="$(sha256sum "${generated_script}" | awk '{print $1}')"
 trial_arg_mode="${TRACK3_TRIAL_ARG_MODE:-}"
 if [[ -z "${trial_arg_mode}" ]]; then
   if [[ "${TRACK3_PASS_TRIAL_ARG:-1}" == "1" ]]; then
-    trial_arg_mode="positional-count"
+    trial_arg_mode="$(python3 - "${source_script}" <<'PY'
+from pathlib import Path
+import sys
+code = Path(sys.argv[1]).read_text().split("\n====================================================================================================", 1)[0]
+print("optional-seed" if 'add_argument("--seed"' in code else "positional-count")
+PY
+)"
   else
     trial_arg_mode="none"
   fi
@@ -43,8 +49,11 @@ case "${trial_arg_mode}" in
     torchrun --standalone --nproc_per_node="${nproc}" "${generated_script}"
     ;;
   optional-seed)
-    seed=$(( ${TRACK3_SEED_BASE:-0} + ${TRACK3_SEED_OFFSET:-0} ))
-    torchrun --standalone --nproc_per_node="${nproc}" "${generated_script}" --seed "${seed}"
+    for ((trial = 0; trial < trials; trial++)); do
+      seed=$(( ${TRACK3_SEED_BASE:-0} + ${TRACK3_SEED_OFFSET:-0} + trial ))
+      TRACK3_SEED_OFFSET=$(( ${TRACK3_SEED_OFFSET:-0} + trial )) \
+        torchrun --standalone --nproc_per_node="${nproc}" "${generated_script}" --seed "${seed}"
+    done
     ;;
   *)
     echo "Unsupported TRACK3_TRIAL_ARG_MODE=${trial_arg_mode}; use positional-count, none, or optional-seed" >&2
