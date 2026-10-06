@@ -6,6 +6,9 @@ Later ablations must record their additional changes separately. The existing
 method is a sampled, additive correction to MLP input weights. It has not yet
 tested LocoProp as the optimizer for the whole transformer.
 
+An additional architecture-level redesign analysis and the explicitly
+experimental full-gradient objective appear at the end of this document.
+
 Primary references are the [AISTATS 2022 paper](https://proceedings.mlr.press/v151/amid22a/amid22a.pdf)
 and the authors' [official training notebook](https://github.com/google-research/google-research/blob/master/locoprop/locoprop_training.ipynb).
 The paper's Algorithms 1–2 define local updates; Figure 3 studies iteration count
@@ -278,3 +281,206 @@ does not guarantee application-wide reproducibility
 ([official contract](https://docs.pytorch.org/docs/2.11/generated/torch.use_deterministic_algorithms.html)).
 The production baseline should retain its original compiled kernels and
 optimizer settings so that these diagnostics do not silently redefine it.
+
+## Rethinking the construction for transformers
+
+The argument for redesign is stronger than the argument for increasing the
+number of RMSProp iterations. The present system solves a narrow surrogate
+accurately, then adds its answer to an independently conditioned native update.
+Neither operation establishes that this surrogate is the right use of compute.
+The following distinguishes code observations from unvalidated design choices.
+
+### Preserve the gradient; sample the curvature
+
+The current sampled objective uses the sample for **both** its linear term and
+its curvature. `raw_grad`, already accumulated over the entire batch and reduced
+across ranks, only checks the correction's cosine. With 524,288 training tokens,
+8,192 captured rows use 1.56% of the batch; the 1,024-row repair screen uses
+0.195%. Sampling is a practical way to reduce curvature cost, but it also
+unnecessarily re-estimates the first-order direction. An alignment gate cannot
+recover information lost from that direction. This is a plausible source of
+inefficiency, not a demonstrated cause of the measured validation differences.
+
+Let \(G\) be the full mean-token weight gradient, and \(S\) a curvature sample.
+The first experimental change is
+
+\[
+Q(\Delta)=\gamma\langle G,\Delta\rangle+
+\frac{1}{|S|}\sum_{s\in S}D_F(a_s+\Delta x_s,a_s)
++\frac{\lambda}{2}\|\Delta\|_F^2.
+\]
+
+Here \(D_F(u,v)=F(u)-F(v)-\langle\nabla F(v),u-v\rangle\), using
+the same squared-ReLU potential as before. Thus \(\nabla Q(0)=\gamma G\)
+regardless of the sample. Equivalently, add the control-variate correction
+\(\gamma\langle G-G_S,\Delta\rangle\) to the old objective. Its curvature
+remains sampled and coordinate-dependent; this change does not make it the
+true loss Hessian. A full gradient is preferable information, but improved
+validation or wall time remains an empirical question.
+
+This opt-in is implemented as `WR_LOCOM_LINEAR_TERM=full` and runner preset
+`rmsprop10_fullgrad`. The May driver uses a sum loss and sum reduction, so the
+adapter divides its full gradient by the global `batch_size` exactly once.
+The solve, line search, post-step gate, and stored-weight recheck use the same
+linear term. It is captured before the native optimizer can mutate gradients.
+This contract is specific to this driver; other reduction conventions require
+an explicit conversion. Defaults keep the old sampled objective.
+
+Tests check an opposing sample gradient, the objective's derivative at zero,
+global-token normalization, native gradient mutation, and final gating with
+a native bias displacement. These tests establish mathematical consistency;
+they do not establish a training win.
+
+### Internal activation distance is not task curvature
+
+For this repository's MLP residual branch,
+
+\[
+u=W_2\operatorname{ReLU}(W_1x+b_1)^2+b_2,
+\]
+
+the simultaneous transformations \(W_1,b_1\mapsto c(W_1,b_1)\) and
+\(W_2\mapsto W_2/c^2\), for \(c>0\), preserve the branch's function in exact
+arithmetic. An objective on the intermediate activation can nevertheless assign
+very different distances and curvature to these equivalent representations.
+Finite-precision execution need not preserve exact equivalence. This example
+shows why a good neuron-coordinate objective need not be a good block objective.
+
+The current matching curvature is related to \(f'(a)\), which does not contain
+the downstream projection's full effect or the suffix network's loss geometry.
+A perturbation in a direction strongly amplified by \(W_2\) can matter more
+than a larger perturbation in a direction that the downstream computation
+largely suppresses. Treating those differences through the actual residual
+branch output is better motivated, but still needs validation.
+
+RMSNorm further changes which perturbations downstream branches see. For the
+normalization without its learned gain, \(n(h)=h/r\),
+\(r=\sqrt{\|h\|^2/d+\epsilon}\),
+
+\[
+J_n=I/r-hh^\top/(d r^3).
+\]
+
+Radial and tangential changes therefore have different effects. This is a
+property of the normalization path: a residual skip retains information, so it
+does **not** imply that every radial change is a null direction of the whole
+transformer. Simply projecting out radial components would be unjustified.
+
+Attention is an even larger departure. Its Q/K interaction, softmax, value
+mixing, Q/K normalization, positional transformation, and residual addition do
+not inherit the elementwise monotone activation argument for the existing
+convex matching objective. The implementation uses squared ReLU, not SwiGLU;
+introducing reasoning specific to a different architecture would obscure the
+actual issue. We need an explicit objective for this transformer block.
+
+### A blockwise implicit update is the main redesign candidate
+
+For a block output \(u=F_l(h;\theta_l)\), freeze the captured input \(h\).
+Let \(J_l\) map parameter perturbations to output perturbations, and let
+\(C_l\succeq0\) approximate the sensitivity of the downstream loss to that
+output. A tractable local model is
+
+\[
+q_l(\Delta)=\langle G_l,\Delta\rangle+
+\tfrac12\Delta^\top(J_l^\top C_lJ_l+\lambda R_l)\Delta,
+\qquad
+(J_l^\top C_lJ_l+\lambda R_l)\Delta=-G_l.
+\]
+
+With suitable positive damping, the linearized problem is a convex quadratic
+even when the block is nonlinear. The actual nonlinear block problem and
+joint network loss need not be convex. This proposal would initially own both
+MLP matrices and their biases, then extend to attention using a separate
+validated Jacobian implementation. It would replace the native update for
+those owned parameters, including skipping its optimizer work and state.
+Embeddings and readout can retain Adam initially; coverage must remain explicit.
+
+The ideal output metric pulls the cross-entropy logit metric
+\(\operatorname{diag}(p)-pp^\top\) back through the suffix network, including
+this model's logit softcap. Computing that exactly at every local iteration
+defeats the purpose. Candidate approximations include diagonal or low-rank
+statistics, moving averages, or occasional curvature probes. Observed-label
+gradient outer products are an empirical Fisher approximation, not automatically
+the model Fisher or generalized Gauss–Newton matrix. Any approximation must
+earn its extra memory and computation against a cheap input-covariance control.
+
+Output-based geometry reduces one source of arbitrary internal coordinates.
+It does not, by itself, make the optimizer invariant to reparameterization:
+damping, low-rank approximation, finite solver accuracy, and trust rules matter.
+Cross-block curvature is also discarded. Occasional actual training-loss checks
+should compare predicted versus realized improvement and calibrate damping.
+A locally accepted update remains insufficient evidence of global improvement.
+
+Shared weights and token dependence deserve explicit treatment. For MLPs,
+sample across sequences and positions; for attention, preserve the causal
+context needed to define sampled queries' outputs. Treating isolated tokens as
+independent examples can change the curvature approximation. This issue also
+appears in [K-FAC for modern architectures](https://arxiv.org/abs/2311.00636),
+which derives distinct treatments of weight sharing. That paper does not
+establish a win for this language-model setup.
+
+### The numerical solver must earn its cost
+
+Persistent RMSProp inner momentum and outer optimization momentum have different
+roles. We should test a design with outer momentum on the full gradient and an
+inner numerical solver for the current damped problem, stopping by residual or
+compute budget. Ten iterations are not intrinsically appropriate. A warm start
+or recycled curvature estimate can be useful, but stale inner momentum should
+not silently determine the new target's displacement.
+
+For a squared linear-layer surrogate with sampled rows \(X\), the exact update is
+
+\[
+\Delta=-\gamma G\left(\lambda I+X^\top X/m\right)^{-1}.
+\]
+
+This gives a particularly clean first control: is cheap implicit
+preconditioning better than the iterative nonlinear matching solve? When
+\(m\ll d_{\rm in}\), Woodbury reduces the solve to an \(m\times m\) system:
+
+\[
+\left(\lambda I+X^\top X/m\right)^{-1}
+=\lambda^{-1}I-\lambda^{-1}X^\top
+(m\lambda I+XX^\top)^{-1}X.
+\]
+
+It is not automatically cheap for the current \(m=1024,d_{\rm in}=768\):
+choose the smaller system, sketch further, or use a few preconditioned iterations.
+These connections to implicit optimization and K-FAC are already part of
+[LocoProp's original motivation](https://proceedings.mlr.press/v151/amid22a/amid22a.pdf);
+this is a redesign proposal, not a claim to a new second-order principle.
+
+For the joint MLP, matrix-free Jacobian products follow from
+\(\delta u=\delta W_2 f(a)+W_2[f'(a)\odot(\delta W_1x+\delta b_1)]+\delta b_2\).
+Batch equal-shaped layer operations and avoid a Python/CUDA synchronization for
+every scalar line-search decision. At larger model scales, shard work vectors
+and curvature state; dense Hessians and several replicated model-sized solver
+vectors are not a credible default. Compare real kernels and memory, not just
+the number of local iterations.
+
+### Evidence that would justify continuing
+
+The next stages should isolate three claims: (A) retain the full gradient with
+existing sampled M curvature; (B) use a cheaper implicit input-covariance solve;
+(C) optimize a joint residual block with an output metric. Implementing all
+three together would make a positive or negative result hard to interpret.
+
+For common-state diagnostics, start from the same checkpoint and batch, then
+measure local predicted improvement, actual train cross-entropy, fresh-sequence
+cross-entropy, full-gradient alignment, solver residual, effective BF16 update,
+and elapsed time. Include a gradient/momentum control with the same update norm
+and a tuned learning-rate control so that a larger step is not mistaken for
+useful curvature. Such one-step probes do not replace end-to-end training.
+
+Then use paired repeated training runs, advance to full length only for plausible
+candidates, and make held-out loss at equal wall time the primary criterion.
+Equal tokens remains useful for diagnosing optimization efficiency. A tiny
+single-seed equal-token improvement with appreciable extra time is insufficient.
+The original figure plots autoencoder train loss against epochs; it supplies a
+reason to test local solvers, not an expectation that this May9 stack must lose.
+
+The main conclusion is architectural: preserve the full learning signal, choose
+a local problem tied to the block's effect on prediction, and make its solution
+cheaper than the training progress it replaces. Whether this can beat native
+May9 is still open. A negative result after these isolated tests would be useful
+evidence against this direction; merely adding more RMSProp iterations would not.

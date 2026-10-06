@@ -32,7 +32,9 @@ from make_wr_record_muon_ablation import generate
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SOURCE = ROOT / "records/track_3_optimization/results/20260509_contra_soft_muon/03c36e81-e2e5-4916-bf16-0141999b1dbb.txt"
 PROFILES = ("simple", "contra", "soft", "soap", "normuon", "floor", "polar_norm", "no_wd", "may9")
-SOLVERS = {"sgd4": ("sgd", 4), "rmsprop10": ("rmsprop", 10)}
+SOLVERS = {"sgd4": ("sgd", 4), "rmsprop10": ("rmsprop", 10),
+           "rmsprop10_safe": ("rmsprop", 10), "rmsprop10_post": ("rmsprop", 10),
+           "rmsprop10_fullgrad": ("rmsprop", 10)}
 SOLVER_METADATA = {
     "sgd4": dict(local_opt="sgd", max_local_steps=4, rms_style="torch", local_lr_decay=False),
     "rmsprop10": dict(local_opt="rmsprop", max_local_steps=10, rms_style="tensorflow",
@@ -40,6 +42,14 @@ SOLVER_METADATA = {
         momentum_beta=.999, squared_gradient_beta=.9, epsilon=1e-5,
         limitations="Sampled c_fc-only hybrid; RMS state commits only after an accepted stored weight update. Local descent/backtracking/norm gates remain enabled; not a fully paper-faithful implementation."),
 }
+for _name, _center in (("rmsprop10_safe", "pre_base"), ("rmsprop10_post", "post_base")):
+    SOLVER_METADATA[_name] = dict(SOLVER_METADATA["rmsprop10"],
+        label="Guarded RMSProp10 with complete-displacement backtracking",
+        scale_momentum=True, center=_center, sample_tokens=1024,
+        limitations="Sampled FC hybrid, with full momentum displacement shrunk during line search. The post_base mode centers its frozen-input correction after the native optimizer step; it is not the paper's standalone layerwise optimizer.")
+SOLVER_METADATA["rmsprop10_fullgrad"] = dict(SOLVER_METADATA["rmsprop10_safe"],
+    label="Full-gradient linear term with sampled M curvature", linear_term="full",
+    limitations="Experimental FC-only hybrid. Preserves the full mean-token gradient as the linear term, but still uses activation-matching curvature and an additive outer update. Not a validated transformer optimizer.")
 DATASET_REVISION = "889765ea1f903759787add96995d81171b632d0c"
 CONTROLLED_PREFIXES = ("WR_MUON_", "WR_LOCOM_", "FINAL_")
 CONTROLLED_NAMES = {"SCREEN_VAL_EVERY", "TRAIN_PROGRESS_INTERVAL"}
@@ -76,13 +86,16 @@ def arm_environment(profile: str, alpha: int, *, native: bool = False,
         "WR_LOCOM_ENABLED": str(int(not native)), "WR_LOCOM_COMPILE": "1",
         "WR_LOCOM_LAYERS": "all", "WR_LOCOM_ACTIVE_WINDOWS": "",
         "WR_LOCOM_START_STEP": "0", "WR_LOCOM_END_STEP": str(steps),
-        "WR_LOCOM_INTERVAL": "1", "WR_LOCOM_SAMPLE_TOKENS": "8192",
+        "WR_LOCOM_INTERVAL": "1", "WR_LOCOM_SAMPLE_TOKENS": str(SOLVER_METADATA[solver].get("sample_tokens", 8192)),
         "WR_LOCOM_STEPS": str(local_steps), "WR_LOCOM_INNER_LR": "0.1",
         "WR_LOCOM_LOCAL_OPT": local_opt,
         "WR_LOCOM_RMS_BETA1": "0.999", "WR_LOCOM_RMS_BETA2": "0.9",
         "WR_LOCOM_RMS_EPS": "1e-5", "WR_LOCOM_RESET_RMS": "0",
         "WR_LOCOM_RMS_STYLE": SOLVER_METADATA[solver]["rms_style"],
         "WR_LOCOM_LR_DECAY": str(int(SOLVER_METADATA[solver]["local_lr_decay"])),
+        "WR_LOCOM_SCALE_MOMENTUM": str(int(SOLVER_METADATA[solver].get("scale_momentum", False))),
+        "WR_LOCOM_CENTER": SOLVER_METADATA[solver].get("center", "pre_base"),
+        "WR_LOCOM_LINEAR_TERM": SOLVER_METADATA[solver].get("linear_term", "sample"),
         "WR_LOCOM_UPDATE_MODE": "partial_fc_replacement" if replacement else "additive",
         "WR_LOCOM_REPLACE_NORM_CAP": "0.01",
         "WR_LOCOM_TARGET_GAMMA": "100", "WR_LOCOM_PROX": "0.1",

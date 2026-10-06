@@ -149,7 +149,7 @@ def test_generated_training_loop_resume_matches_continuous_weights_soap_rms_and_
         rt.extra_val_steps, rt.TRAIN_PROGRESS_INTERVAL = set(), 0
         rt.code, rt.training_time, rt.start_step = text, 0.0, 0
         rt.time = __import__("time")
-        rt._wr_locom_begin_step = lambda *a: None
+        rt._wr_locom_begin_step = lambda *a, **kw: None
         rt.prepare_wr_locom_m = lambda *a: None
         def apply(model, optimizer, step):
             model._loco_rms_avg.lerp_(model.fc.weight.grad.square(), .1)

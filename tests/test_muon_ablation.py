@@ -155,7 +155,7 @@ def test_plan_pairs_and_single_lever_settings(harness, tmp_path):
         arm = harness.profile_settings(profile)
         assert sum(simple[key] != arm[key] for key in simple if key != "profile") == 1
     for profile in harness.PROFILES:
-        for solver in harness.SOLVERS:
+        for solver in plan["solvers"]:
             control = next(arm for arm in plan["arms"] if arm["id"] == f"{profile}_alpha0_{solver}_seed3710")
             treatment = next(arm for arm in plan["arms"] if arm["id"] == f"{profile}_alpha1_{solver}_seed3710")
             assert {key for key in control["env"] if control["env"][key] != treatment["env"][key]} == {"WR_LOCOM_ALPHA"}

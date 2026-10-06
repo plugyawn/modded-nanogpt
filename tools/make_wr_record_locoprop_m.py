@@ -85,10 +85,18 @@ if WR_LOCOM_RMS_STYLE not in {"torch", "tensorflow"}:
     raise ValueError("WR_LOCOM_RMS_STYLE must be 'torch' or 'tensorflow'")
 WR_LOCOM_RESET_RMS = _wr_locom_flag("WR_LOCOM_RESET_RMS", "0")
 WR_LOCOM_LR_DECAY = _wr_locom_flag("WR_LOCOM_LR_DECAY", "0")
+WR_LOCOM_SCALE_MOMENTUM = _wr_locom_flag("WR_LOCOM_SCALE_MOMENTUM", "0")
+WR_LOCOM_CENTER = os.environ.get("WR_LOCOM_CENTER", "pre_base")
+if WR_LOCOM_CENTER not in {"pre_base", "post_base"}:
+    raise ValueError("WR_LOCOM_CENTER must be pre_base or post_base")
+WR_LOCOM_LINEAR_TERM = os.environ.get("WR_LOCOM_LINEAR_TERM", "sample")
+if WR_LOCOM_LINEAR_TERM not in {"sample", "full"}:
+    raise ValueError("WR_LOCOM_LINEAR_TERM must be sample or full")
 
 WR_LOCOM_CURRENT_STEP = -1
 WR_LOCOM_NEXT_LAYER = 0
 WR_LOCOM_CORR: dict[int, tuple] = {}
+WR_LOCOM_LINEAR_GRADS: dict[int, Tensor] = {}
 WR_LOCOM_APPLY_STATS: list[str] = []
 
 def _wr_locom_active(step: int) -> bool:
@@ -103,11 +111,15 @@ def _wr_locom_active(step: int) -> bool:
 def _wr_locom_layer_active(layer_idx: int) -> bool:
     return layer_idx in WR_LOCOM_LAYER_SET
 
-def _wr_locom_begin_step(step: int, microbatches: int = 1) -> None:
+def _wr_locom_begin_step(step: int, microbatches: int = 1, model=None) -> None:
     global WR_LOCOM_CURRENT_STEP
     WR_LOCOM_CURRENT_STEP = step
     WR_LOCOM_CORR.clear()
+    WR_LOCOM_LINEAR_GRADS.clear()
     WR_LOCOM_APPLY_STATS.clear()
+    if model is not None:
+        for block in model.blocks:
+            block.mlp.wr_locom_capture_now = _wr_locom_active(step)
     loco_begin_capture(step, microbatches, _wr_locom_active(step),
                        WR_LOCOM_LAYER_SET, WR_LOCOM_ACCUM_SAMPLES, dist.get_rank())
 
@@ -133,6 +145,22 @@ def prepare_wr_locom_m(model: nn.Module, step: int) -> None:
             continue
         x, pre0, dpre = _wr_locom_gather(sx), _wr_locom_gather(sp), _wr_locom_gather(sg)
         raw_grad = layer.fc.weight.grad
+        linear_grad = None
+        if WR_LOCOM_LINEAR_TERM == "full" and raw_grad is not None:
+            # This driver sums token losses, accumulated microbatches, and
+            # distributed gradients. batch_size is the global token count.
+            if batch_size <= 0:
+                raise ValueError("full linear term requires a positive global token count")
+            linear_grad = raw_grad.detach().float() / batch_size
+            WR_LOCOM_LINEAR_GRADS[layer_idx] = linear_grad
+        if WR_LOCOM_CENTER == "post_base":
+            # Defer the solve until the native optimizer has moved the weights.
+            # Keep the captured global gradient; this remains a frozen-input
+            # correction surrogate, not a second full-model backward pass.
+            bias_reference = layer.fc.bias.detach().float().clone() if layer.fc.bias is not None else None
+            WR_LOCOM_CORR[layer_idx] = (None, layer.fc.weight.detach().float().clone(),
+                x, pre0, dpre, bias_reference, raw_grad.detach().float().clone() if raw_grad is not None else None)
+            continue
         corr, diag, staged_rms = loco_solve(
             x, pre0, dpre, raw_grad, steps=WR_LOCOM_STEPS,
             inner_lr=WR_LOCOM_INNER_LR, gamma=WR_LOCOM_TARGET_GAMMA,
@@ -144,6 +172,8 @@ def prepare_wr_locom_m(model: nn.Module, step: int) -> None:
             beta2=WR_LOCOM_RMS_BETA2, rms_eps=WR_LOCOM_RMS_EPS,
             reset_rms=WR_LOCOM_RESET_RMS, lr_decay=WR_LOCOM_LR_DECAY,
             rms_style=WR_LOCOM_RMS_STYLE,
+            scale_momentum=WR_LOCOM_SCALE_MOMENTUM,
+            linear_grad=linear_grad,
         )
         if diag["accepted"]:
             bias_reference = layer.fc.bias.detach().float().clone() if layer.fc.bias is not None else None
@@ -169,20 +199,47 @@ def apply_wr_locom_m(model: nn.Module, optimizer: torch.optim.Optimizer, step: i
         corr, reference, x, pre0, dpre, bias_reference, staged_rms = context
         layer = model.blocks[layer_idx].mlp
         p = layer.fc.weight
-        corr_f = corr.float()
-        corr_norm = corr_f.norm()
+        linear_grad = WR_LOCOM_LINEAR_GRADS.get(layer_idx)
         # Muon has already gathered the updated weights onto every rank. Measure
         # their actual displacement; only the owner has the optimizer's state.
         base_delta = p.float() - reference
         base_step_norm = base_delta.norm()
         bias_delta = layer.fc.bias.float() - bias_reference if bias_reference is not None else None
+        if WR_LOCOM_CENTER == "post_base":
+            raw_grad = staged_rms
+            pre0 = pre0 + x @ base_delta.mT
+            if bias_delta is not None:
+                pre0 = pre0 + bias_delta
+            corr, diag, staged_rms = loco_solve(
+                x, pre0, dpre, raw_grad, steps=WR_LOCOM_STEPS,
+                inner_lr=WR_LOCOM_INNER_LR, gamma=WR_LOCOM_TARGET_GAMMA,
+                prox=WR_LOCOM_PROX, min_cos=WR_LOCOM_MIN_COS_DESC,
+                require_decrease=WR_LOCOM_REQUIRE_LOSS_DECREASE,
+                max_backtracks=WR_LOCOM_MAX_BACKTRACKS, output_dtype=p.dtype,
+                local_opt=WR_LOCOM_LOCAL_OPT, rms_avg=layer._loco_rms_avg,
+                rms_mom=layer._loco_rms_mom, beta1=WR_LOCOM_RMS_BETA1,
+                beta2=WR_LOCOM_RMS_BETA2, rms_eps=WR_LOCOM_RMS_EPS,
+                reset_rms=WR_LOCOM_RESET_RMS, lr_decay=WR_LOCOM_LR_DECAY,
+                rms_style=WR_LOCOM_RMS_STYLE, scale_momentum=WR_LOCOM_SCALE_MOMENTUM,
+                linear_grad=linear_grad)
+            if step in WR_LOCOM_LOG_STEPS:
+                print0(f"wr_locom_prepare step={step} l{layer_idx}:loss0={diag['loss0']:.3e},lossK={diag['lossK']:.3e},corr={float(corr.float().norm()):.3e},cos={diag['cos_desc']:.3f},accepted={int(diag['accepted'])},tokens={x.size(0)},backtracks={diag['backtracks']},local_steps={diag['local_steps']},inner_lr={diag['inner_lr']:.3e},reason={diag['reason']},center=post_base", console=True)
+            if not diag["accepted"]:
+                continue
+            # Center both the trust penalty and final stored-weight check at
+            # the same native state used by the solve.
+            reference = p.detach().float().clone()
+            base_delta = torch.zeros_like(reference)
+            bias_delta = None
+        corr_norm = corr.float().norm()
         scale = loco_correction_scale(corr, base_step_norm, alpha=WR_LOCOM_ALPHA,
                                      cap=WR_LOCOM_NORM_CAP, norm_to_base=WR_LOCOM_NORM_TO_BASE)
         scale, gate = loco_post_step_scale(corr, scale, base_delta, x, pre0, dpre,
                                           gamma=WR_LOCOM_TARGET_GAMMA, prox=WR_LOCOM_PROX,
                                           max_backtracks=WR_LOCOM_MAX_BACKTRACKS,
                                           bias_delta=bias_delta, current_weight=p,
-                                          reference_weight=reference, return_info=True)
+                                          reference_weight=reference, return_info=True,
+                                          linear_grad=linear_grad)
         applied = gate["candidate"] is not None
         logged = step in WR_LOCOM_LOG_STEPS
         stored_norm, bf16_fraction = 0.0, 0.0
@@ -203,6 +260,7 @@ def apply_wr_locom_m(model: nn.Module, optimizer: torch.optim.Optimizer, step: i
                 f",gate_final_checks={gate['final_checks']},gate_reason={gate['reason']}"
             )
     WR_LOCOM_CORR.clear()
+    WR_LOCOM_LINEAR_GRADS.clear()
     if step in WR_LOCOM_LOG_STEPS and WR_LOCOM_APPLY_STATS:
         print0("wr_locom_apply step=" + str(step) + " " + " | ".join(WR_LOCOM_APPLY_STATS), console=True)
 '''
@@ -215,6 +273,7 @@ MLP_BLOCK = r'''class MLP(nn.Module):
         self.layer_idx = WR_LOCOM_NEXT_LAYER
         WR_LOCOM_NEXT_LAYER += 1
         self.wr_locom_layer_enabled = WR_LOCOM_ENABLED and _wr_locom_layer_active(self.layer_idx)
+        self.wr_locom_capture_now = True
         hdim = 4 * dim
         self.fc = Linear(dim, hdim)
         self.proj = Linear(hdim, dim)
@@ -228,7 +287,7 @@ MLP_BLOCK = r'''class MLP(nn.Module):
         self.register_buffer("_loco_rms_mom", torch.zeros_like(self.fc.weight, dtype=torch.float32) if rms_enabled else None)
 
     def forward(self, x: Tensor):
-        if self.wr_locom_layer_enabled:
+        if self.wr_locom_layer_enabled and self.wr_locom_capture_now:
             return LocoMLPFunction.apply(x, self.fc.weight, self.fc.bias,
                                         self.proj.weight, self.proj.bias,
                                         self._loco_samples, self.layer_idx)
@@ -320,7 +379,7 @@ def generate(source: Path, output: Path, train_steps: int, schedule_steps: int |
         "    f\"prox={WR_LOCOM_PROX} alpha={WR_LOCOM_ALPHA} norm_cap={WR_LOCOM_NORM_CAP} \"\n"
         "    f\"norm_to_base={WR_LOCOM_NORM_TO_BASE} min_cos={WR_LOCOM_MIN_COS_DESC} \"\n"
         "    f\"local_opt={WR_LOCOM_LOCAL_OPT} rms_beta1={WR_LOCOM_RMS_BETA1} rms_beta2={WR_LOCOM_RMS_BETA2} \"\n"
-        "    f\"rms_eps={WR_LOCOM_RMS_EPS} rms_style={WR_LOCOM_RMS_STYLE} reset_rms={WR_LOCOM_RESET_RMS} lr_decay={WR_LOCOM_LR_DECAY}\",\n"
+        "    f\"rms_eps={WR_LOCOM_RMS_EPS} rms_style={WR_LOCOM_RMS_STYLE} reset_rms={WR_LOCOM_RESET_RMS} lr_decay={WR_LOCOM_LR_DECAY} center={WR_LOCOM_CENTER} scale_momentum={WR_LOCOM_SCALE_MOMENTUM} linear_term={WR_LOCOM_LINEAR_TERM}\",\n"
         "    console=True,\n"
         ")\n"
         "print0(\"=\"*100)\n\nval_tokens = 20 * 524288\n",
@@ -328,7 +387,7 @@ def generate(source: Path, output: Path, train_steps: int, schedule_steps: int |
     text = replace_exact(
         text,
         "for step in range(train_steps + 1):\n",
-        "for step in range(train_steps + 1):\n    _wr_locom_begin_step(step)\n",
+        "for step in range(train_steps + 1):\n    _wr_locom_begin_step(step, model=model)\n",
     )
     text = replace_exact(
         text,
@@ -344,7 +403,7 @@ def generate(source: Path, output: Path, train_steps: int, schedule_steps: int |
     text = replace_exact(
         text,
         "    for i in range(len(inputs) // mbs):\n",
-        "    _wr_locom_begin_step(step, len(inputs) // mbs)\n"
+        "    _wr_locom_begin_step(step, len(inputs) // mbs, model=model)\n"
         "    for i in range(len(inputs) // mbs):\n"
         "        loco_set_microbatch(i)\n",
     )

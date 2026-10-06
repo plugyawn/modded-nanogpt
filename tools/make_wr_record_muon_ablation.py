@@ -42,7 +42,7 @@ def _wr_ablation_checkpoint_identity():
                 "PROX", "ALPHA", "NORM_CAP", "NORM_TO_BASE", "REQUIRE_LOSS_DECREASE",
                 "MIN_COS_DESC", "MAX_BACKTRACKS", "ACCUM_SAMPLES", "LOCAL_OPT",
                 "RMS_BETA1", "RMS_BETA2", "RMS_EPS", "RMS_STYLE", "RESET_RMS", "LR_DECAY",
-                "UPDATE_MODE", "REPLACE_NORM_CAP")
+                "UPDATE_MODE", "REPLACE_NORM_CAP", "CENTER", "SCALE_MOMENTUM", "LINEAR_TERM")
     return dict(generated_sha256=hashlib.sha256(code.encode()).hexdigest(),
         seed=SEED, world_size=dist.get_world_size(), train_steps=train_steps,
         schedule_steps=FINAL_SCHEDULE_STEPS, batch_size=batch_size, mbs=mbs,

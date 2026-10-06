@@ -129,9 +129,75 @@ training trajectories already differed before a resume, so those trajectories
 do not provide an isolated checkpoint serialization test. See the
 [`method audit`](locoprop_method_audit.md#cuda-trajectory-differences-and-checkpoint-restoration-are-separate-checks).
 
-The frozen full queue contains twelve 3040-update initial arms, eight additional
+The original frozen full queue contained twelve 3040-update initial arms, eight additional
 RMSProp/control arms for seeds 3711 and 3712, and fourteen single-component
 RMSProp/control arms. These retain the 3105-update learning-rate schedule. Seed
 replications are descriptive; the seven component comparisons remain exploratory.
-The queue runs only within the authorized total compute budget, so every planned
-arm must retain its actual completion, interruption or unstarted status.
+That broad queue was superseded by the targeted work below. Interrupted and
+unstarted entries retain their actual status and cannot become full-run results.
+
+## Targeted repair after the unfavorable pilot
+
+The broad queue was superseded after the user requested a repair of the
+quality/time tradeoff. Five experimental full runs were checkpointed and stopped;
+their partial metrics are not full-run results. The native simple-Muon baseline
+was retained. The targeted 500-step comparison completed native May9 and four
+repaired configurations with finite final validation:
+
+| Configuration (seed 3710) | Validation loss | Recorded training seconds | Overhead vs native |
+| --- | ---: | ---: | ---: |
+| Native May9 | 3.82535 | 737.770 | — |
+| Safe RMS10, pre-native center | 3.82082 | 863.052 | 17.0% |
+| Safe RMS10, post-native center | 3.82557 | 871.788 | 18.2% |
+| Post-native, every 4 updates, 5% cap | 3.82490 | 790.460 | 7.1% |
+| Post-native, every 4 updates, 20% cap | 3.82334 | 790.248 | 7.1% |
+
+These single-seed equal-token differences do not establish a reliable quality
+benefit or a win at equal wall time. Recorded training time excludes validation
+and checkpoint IO. The 500-step comparison must not be pooled with the old
+125-step timings. Configurations and verified archive checksums are in
+[`locoprop_repair_20261006.json`](locoprop_repair_20261006.json).
+
+The logged May9 RMS pilot applied only 12 of 36 proposed corrections at the
+recorded nonzero-gradient snapshots. Some inner solves also exhausted 21 trials
+because shrinking the new gradient contribution did not shrink carried
+TensorFlow momentum. The following changes address these observed mechanisms:
+
+- `WR_LOCOM_SCALE_MOMENTUM=1` shrinks the complete proposed momentum displacement
+  during backtracking and commits the accepted displacement to its momentum slot.
+  It preserves legacy TensorFlow arithmetic when no shrinkage is needed, while
+  making a rejected proposal approach the current iterate as its scale tends to
+  zero. This is an explicit safeguard, not a claim of exact paper arithmetic.
+- The outer gate computes its directional derivative. Convexity of the matching
+  objective makes a nonnegative derivative sufficient to reject every positive
+  scale, avoiding twenty futile objective evaluations.
+- `WR_LOCOM_CENTER=post_base` defers the local solve until after the native
+  optimizer update. Both the solve and gate center their activation and proximal
+  terms at that same affine state, including the native bias displacement.
+  Captured inputs and global gradients remain frozen; this is an additional
+  correction surrogate, not a new full-model backward pass or standalone LocoProp.
+- On inactive scheduled updates, generated MLPs execute their native forward and
+  backward graph. Sparse correction schedules reuse two compiled graph variants,
+  avoiding capture machinery on every inactive update.
+
+The `rmsprop10_safe` and `rmsprop10_post` solver presets use complete-displacement
+backtracking and 1024 sampled tokens. The former keeps the original pre-update
+center; the latter uses the post-native center. The targeted screen also compares
+post-native corrections every fourth step at norm caps 0.05 and 0.20. Baseline
+quality, actual applied updates and recorded training time must decide whether
+any of these configurations should be promoted. No speed or quality win is
+assumed from the code changes alone.
+
+The next bounded screen compares full-gradient and sampled-linear-term versions
+of the same pre-native objective for seeds 3710 and 3711, using the first screen's
+seed-3710 sampled arm. It adds a native seed-3711 control and a seed-3711 repeat
+of the sparse 20% post-native correction. The five new 500-step jobs reuse the
+existing GPUs; each lane is configured to archive results and terminate its
+resource when finished. No full-length follow-on candidate is admitted on the
+basis of the small single-seed differences above.
+
+`rmsprop10_fullgrad` sets `WR_LOCOM_LINEAR_TERM=full`: preserve the full mean-token
+gradient as the objective's linear term and sample only its matching curvature.
+This is an experimental change of objective, not a proven improvement. Its
+derivation, limitations, and the larger residual-block redesign are in the
+[`method audit`](locoprop_method_audit.md#rethinking-the-construction-for-transformers).

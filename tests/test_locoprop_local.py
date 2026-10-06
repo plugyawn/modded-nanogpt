@@ -148,7 +148,7 @@ def test_post_step_gate_accepted_candidate_passes_actual_stored_objective():
     assert loco.loco_matching_objective(expected.float() - current.float(), x, pre, dpre, 1., .1) < 0
 
 
-def test_exhausted_post_step_gate_projects_only_twice():
+def test_convex_non_descent_gate_rejects_without_backtracking():
     from torch.utils._python_dispatch import TorchDispatchMode
     class CountMatmuls(TorchDispatchMode):
         count = 0
@@ -161,7 +161,8 @@ def test_exhausted_post_step_gate_projects_only_twice():
     with counter:
         scale, info = loco.loco_post_step_scale(torch.tensor([[.01]]), torch.tensor(1.),
                                                torch.zeros(1, 1), x, pre, dpre, return_info=True)
-    assert scale == 0 and info["attempts"] == 21 and info["backtracks"] == 20
+    assert scale == 0 and info["attempts"] == info["backtracks"] == 0
+    assert info["reason"] == "non_descent_direction"
     assert counter.count == 2
 
 

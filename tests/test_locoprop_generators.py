@@ -187,7 +187,7 @@ def test_record_rms_solver_honors_explicit_momentum_reset_and_decay(monkeypatch)
     torch.testing.assert_close(layer._loco_rms_mom, torch.full_like(layer._loco_rms_mom, .3))
 
 
-@pytest.mark.parametrize("reason", ["stored_noop", "no_decrease"])
+@pytest.mark.parametrize("reason", ["stored_noop", "non_descent_direction"])
 def test_record_rejected_application_preserves_rms_state(monkeypatch, reason):
     monkeypatch.setenv("WR_LOCOM_LOCAL_OPT", "rmsprop")
     rt = runtime("make_wr_record_locoprop_m")
